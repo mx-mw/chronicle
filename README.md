@@ -105,13 +105,56 @@ one self-contained sentence with a backlink to the meeting it came from. Make
 | `/record start` | Joins your voice channel and starts recording (announces itself in-channel) |
 | `/record stop` | Stops, transcribes, distills locally, files the meeting into `kb/`, posts the summary |
 | `/record status` | Shows recording duration and speakers so far |
-| `/recall query:<text>` | Searches the knowledge base and returns matching notes |
+| `/recall query:<text>` | Answers a question over the knowledge base, citing the notes it used |
 
 You can also ingest a recording made elsewhere:
 
 ```sh
 npm run ingest -- path/to/meeting.m4a --speaker "Max"
 ```
+
+And query the palace from the terminal:
+
+```sh
+npm run recall -- "what did we decide about storage?"
+npm run recall -- "storage" --raw    # show retrieved excerpts, skip the model
+npm run index                        # rebuild the search index from kb/
+```
+
+## Search
+
+`/recall` is retrieval-augmented, not a text search. Asking *"how much are we
+charging customers?"* finds the pricing note even though it never uses the word
+"charging".
+
+Two searches run over the notes and are fused by reciprocal rank: BM25 keyword
+matching (SQLite FTS5) and cosine similarity over local embeddings. Keyword
+search alone misses paraphrases; vector search alone misses exact names and
+identifiers. Topic notes are weighted slightly above meeting notes, because the
+durable fact usually answers better than the conversation it came from.
+
+Chunks are individual facts, not sliding windows — the distillation step already
+produced atomic, self-contained sentences, so there is nothing to re-cut.
+
+The index is a SQLite file beside the notes (`kb/.index.db`). Markdown stays the
+source of truth: delete the index and `npm run index` rebuilds it. It refreshes
+automatically whenever a meeting is filed, and incrementally — re-indexing after
+one new meeting embeds only that meeting.
+
+## Local, or Claude
+
+Distillation and `/recall` answers run on whichever backend you configure:
+
+```sh
+LLM_PROVIDER=local       # default — nothing leaves your machine
+LLM_PROVIDER=anthropic   # requires ANTHROPIC_API_KEY
+```
+
+Embeddings are always local, so the corpus itself never leaves your machine
+either way. With `anthropic`, only the excerpts retrieved for a given question
+are sent. Going off-machine is opt-in: an unset `LLM_PROVIDER` keeps everything
+offline, and setting it to `anthropic` without a key fails at startup rather
+than mid-meeting.
 
 ## Consent
 
