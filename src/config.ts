@@ -19,6 +19,27 @@ export const config = {
   get guildId(): string | undefined {
     return process.env.GUILD_ID || undefined;
   },
+  /**
+   * Which backend distils meetings. `local` keeps everything offline; `anthropic`
+   * sends transcripts to Claude. Defaults to local — going off-machine should be
+   * a deliberate choice, never something you get by forgetting to set a variable.
+   */
+  get llmProvider(): 'local' | 'anthropic' {
+    const raw = (process.env.LLM_PROVIDER || 'local').toLowerCase();
+    if (raw !== 'local' && raw !== 'anthropic') {
+      throw new Error(`LLM_PROVIDER must be "local" or "anthropic", got "${raw}".`);
+    }
+    if (raw === 'anthropic' && !process.env.ANTHROPIC_API_KEY) {
+      throw new Error('LLM_PROVIDER=anthropic requires ANTHROPIC_API_KEY to be set.');
+    }
+    return raw;
+  },
+  get anthropicApiKey(): string {
+    return required('ANTHROPIC_API_KEY');
+  },
+  get anthropicModel(): string {
+    return process.env.ANTHROPIC_MODEL || 'claude-opus-4-8';
+  },
   /** Base URL of the local OpenAI-compatible server (e.g. llama.cpp's `llama-server`). */
   get llmBaseUrl(): string {
     return process.env.LLM_BASE_URL || 'http://127.0.0.1:8080/v1';

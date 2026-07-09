@@ -1,4 +1,4 @@
-import { config } from './config.js';
+import { completeJson } from './llm.js';
 
 export interface MeetingSummary {
   title: string;
@@ -42,15 +42,46 @@ Respond with ONLY a JSON object, no markdown fences, matching this schema:
   ]
 }`;
 
-function extractJson(text: string): unknown {
-  const trimmed = text.trim();
-  const fenced = trimmed.match(/```(?:json)?\s*([\s\S]*?)```/);
-  const candidate = fenced ? fenced[1] : trimmed;
-  const start = candidate.indexOf('{');
-  const end = candidate.lastIndexOf('}');
-  if (start === -1 || end === -1) throw new Error('No JSON object in model response');
-  return JSON.parse(candidate.slice(start, end + 1));
-}
+/**
+ * The same shape the system prompt describes, in a form the API can enforce.
+ * Local models see only the prose version and are trusted to comply; Claude is
+ * held to this one server-side.
+ */
+const SUMMARY_SCHEMA = {
+  type: 'object',
+  properties: {
+    title: { type: 'string' },
+    slug: { type: 'string' },
+    summary: { type: 'string' },
+    decisions: { type: 'array', items: { type: 'string' } },
+    action_items: {
+      type: 'array',
+      items: {
+        type: 'object',
+        properties: { owner: { type: 'string' }, task: { type: 'string' } },
+        required: ['owner', 'task'],
+        additionalProperties: false,
+      },
+    },
+    open_questions: { type: 'array', items: { type: 'string' } },
+    facts: {
+      type: 'array',
+      items: {
+        type: 'object',
+        properties: {
+          topic: { type: 'string' },
+          topic_title: { type: 'string' },
+          topic_description: { type: 'string' },
+          fact: { type: 'string' },
+        },
+        required: ['topic', 'topic_title', 'topic_description', 'fact'],
+        additionalProperties: false,
+      },
+    },
+  },
+  required: ['title', 'slug', 'summary', 'decisions', 'action_items', 'open_questions', 'facts'],
+  additionalProperties: false,
+} as const;
 
 export async function summarizeMeeting(input: {
   transcript: string;
@@ -58,42 +89,20 @@ export async function summarizeMeeting(input: {
   date: string;
   durationMinutes: number;
 }): Promise<MeetingSummary> {
-  const res = await fetch(`${config.llmBaseUrl}/chat/completions`, {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      ...(config.llmApiKey ? { Authorization: `Bearer ${config.llmApiKey}` } : {}),
-    },
-    body: JSON.stringify({
-      model: config.llmModel,
-      max_tokens: 8_000,
-      messages: [
-        { role: 'system', content: SYSTEM_PROMPT },
-        {
-          role: 'user',
-          content: `Meeting date: ${input.date}
+  const parsed = (await completeJson({
+    system: SYSTEM_PROMPT,
+    user: `Meeting date: ${input.date}
 Duration: ~${input.durationMinutes} minutes
 Participants: ${input.participants.join(', ') || 'unknown'}
 
 Transcript:
 ${input.transcript}`,
-        },
-      ],
-    }),
-  });
+    schema: SUMMARY_SCHEMA as unknown as Record<string, unknown>,
+    maxTokens: 8_000,
+  })) as MeetingSummary;
 
-  if (!res.ok) {
-    throw new Error(
-      `Local LLM request failed (${res.status} ${res.statusText}): ${await res.text()}. Is llama-server running at ${config.llmBaseUrl}?`,
-    );
-  }
-
-  const data = (await res.json()) as {
-    choices: { message: { content: string } }[];
-  };
-  const text = data.choices[0]?.message.content ?? '';
-
-  const parsed = extractJson(text) as MeetingSummary;
+  // Claude's schema guarantees this; a local model's compliance is only a
+  // strong suggestion, so the check stays.
   if (!parsed.title || !parsed.slug || !Array.isArray(parsed.facts)) {
     throw new Error('Model response missing required summary fields');
   }
