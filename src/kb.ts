@@ -120,7 +120,29 @@ export async function writeMeeting(
   await writeFile(meetingPath, note);
 
   await rebuildIndex();
+  await refreshSearchIndex();
   return { meetingPath, transcriptPath, topicPaths };
+}
+
+/**
+ * Keep the search index in step with the notes we just wrote — a meeting that
+ * isn't indexed can't be recalled.
+ *
+ * Best-effort on purpose: the markdown is already safely on disk, and the index
+ * is a derived cache that `npm run index` can rebuild. A down embedding server
+ * must not lose a recorded meeting.
+ */
+async function refreshSearchIndex(): Promise<void> {
+  try {
+    const { buildIndex } = await import('./store.js');
+    await buildIndex();
+  } catch (err) {
+    console.error(
+      'Notes were filed, but indexing them for search failed. They will not appear in ' +
+        '`/recall` until you run `npm run index`.\n',
+      err instanceof Error ? err.message : err,
+    );
+  }
 }
 
 /** Rebuild INDEX.md — the palace map — from what's actually on disk. */
@@ -150,27 +172,5 @@ export async function rebuildIndex(): Promise<void> {
   await writeFile(path.join(config.kbDir, 'INDEX.md'), index);
 }
 
-export interface SearchHit {
-  file: string; // kb-relative path
-  line: string;
-}
-
-/** Case-insensitive substring search across all notes (transcripts excluded). */
-export async function searchKb(query: string, limit = 12): Promise<SearchHit[]> {
-  const needle = query.toLowerCase();
-  const hits: SearchHit[] = [];
-  for (const sub of ['topics', 'meetings']) {
-    const dir = path.join(config.kbDir, sub);
-    if (!existsSync(dir)) continue;
-    for (const file of (await readdir(dir)).filter((f) => f.endsWith('.md')).sort()) {
-      const content = await readFile(path.join(dir, file), 'utf8');
-      for (const line of content.split('\n')) {
-        if (line.toLowerCase().includes(needle) && !line.startsWith('---')) {
-          hits.push({ file: `${sub}/${file}`, line: line.trim() });
-          if (hits.length >= limit) return hits;
-        }
-      }
-    }
-  }
-  return hits;
-}
+// Search moved to store.ts: substring matching couldn't answer "what did we
+// decide about storage?" when the note says "SQLite index". See search() there.

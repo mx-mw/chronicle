@@ -8,7 +8,9 @@
     "build": "tsc",
     "start": "node dist/index.js",
     "dev": "tsx src/index.ts",
-    "ingest": "tsx src/ingest.ts"
+    "ingest": "tsx src/ingest.ts",
+    "index": "tsx src/index-cli.ts",
+    "recall": "tsx src/recall-cli.ts"
   },
   "engines": {
     "node": ">=20"

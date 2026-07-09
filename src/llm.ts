@@ -103,6 +103,55 @@ export async function completeJson(req: JsonRequest): Promise<unknown> {
     : completeJsonLocal(req);
 }
 
+/** Ask the configured model for prose. Used by `/recall` to answer over the KB. */
+export async function completeText(req: {
+  system: string;
+  user: string;
+  maxTokens?: number;
+}): Promise<string> {
+  const maxTokens = req.maxTokens ?? 2_000;
+
+  if (config.llmProvider === 'anthropic') {
+    const client = new Anthropic({ apiKey: config.anthropicApiKey });
+    const response = await client.messages.create({
+      model: config.anthropicModel,
+      max_tokens: maxTokens,
+      thinking: { type: 'adaptive' },
+      system: req.system,
+      messages: [{ role: 'user', content: req.user }],
+    });
+    if (response.stop_reason === 'refusal') {
+      throw new Error('Claude declined to answer this question.');
+    }
+    return response.content
+      .filter((block): block is Anthropic.TextBlock => block.type === 'text')
+      .map((block) => block.text)
+      .join('')
+      .trim();
+  }
+
+  const res = await fetch(`${config.llmBaseUrl}/chat/completions`, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      ...(config.llmApiKey ? { Authorization: `Bearer ${config.llmApiKey}` } : {}),
+    },
+    body: JSON.stringify({
+      model: config.llmModel,
+      max_tokens: maxTokens,
+      messages: [
+        { role: 'system', content: req.system },
+        { role: 'user', content: req.user },
+      ],
+    }),
+  });
+  if (!res.ok) {
+    throw new Error(`Local LLM request failed (${res.status}): ${await res.text()}`);
+  }
+  const data = (await res.json()) as { choices: { message: { content: string } }[] };
+  return (data.choices[0]?.message.content ?? '').trim();
+}
+
 /** Human-readable description of the active backend, for startup logs. */
 export function describeProvider(): string {
   return config.llmProvider === 'anthropic'

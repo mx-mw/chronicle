@@ -8,8 +8,9 @@ import {
 } from 'discord.js';
 import path from 'node:path';
 import { config } from './config.js';
-import { searchKb } from './kb.js';
+import { describeProvider } from './llm.js';
 import { processMeeting } from './pipeline.js';
+import { recall } from './recall.js';
 import { RecordingSession } from './recorder.js';
 import { assertParakeetReady } from './transcribe.js';
 
@@ -50,6 +51,7 @@ client.once('clientReady', async () => {
     await client.application!.commands.set(commands);
   }
   console.log(`Chronicle is ready as ${client.user!.tag}`);
+  console.log(`Distilling and answering with ${describeProvider()}`);
 });
 
 async function handleRecordStart(interaction: ChatInputCommandInteraction): Promise<void> {
@@ -149,21 +151,22 @@ async function handleRecordStatus(interaction: ChatInputCommandInteraction): Pro
 
 async function handleRecall(interaction: ChatInputCommandInteraction): Promise<void> {
   const query = interaction.options.getString('query', true);
-  const hits = await searchKb(query);
+  // Retrieval embeds the query and a model writes the answer, so this runs well
+  // past Discord's 3-second reply deadline.
+  await interaction.deferReply();
+
+  const { answer, hits } = await recall(query);
   if (hits.length === 0) {
-    await interaction.reply({ content: `Nothing in the knowledge base matches “${query}”.` });
+    await interaction.editReply(`Nothing in the knowledge base is relevant to “${query}”.`);
     return;
   }
-  const byFile = new Map<string, string[]>();
-  for (const hit of hits) {
-    if (!byFile.has(hit.file)) byFile.set(hit.file, []);
-    byFile.get(hit.file)!.push(hit.line);
-  }
-  let body = '';
-  for (const [file, lines] of byFile) {
-    body += `**${file}**\n${lines.map((l) => `> ${l.slice(0, 200)}`).join('\n')}\n`;
-  }
-  await interaction.reply({ content: `🔎 Results for “${query}”:\n${body}`.slice(0, 1990) });
+
+  const sources = [...new Set(hits.map((h) => h.file.replace(/\.md$/, '')))];
+  const embed = new EmbedBuilder()
+    .setTitle(`🔎 ${query}`.slice(0, 256))
+    .setDescription(answer.slice(0, 4000))
+    .setFooter({ text: `Sources: ${sources.join(' · ')}`.slice(0, 2048) });
+  await interaction.editReply({ embeds: [embed] });
 }
 
 client.on('interactionCreate', async (interaction) => {
