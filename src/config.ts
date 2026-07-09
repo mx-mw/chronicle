@@ -52,6 +52,21 @@ export const config = {
   get llmApiKey(): string | undefined {
     return process.env.LLM_API_KEY || undefined;
   },
+  /**
+   * Embeddings are always local — Anthropic has no embeddings endpoint, so
+   * there is no cloud variant of this setting. Defaults to the same server
+   * that serves local distillation.
+   */
+  get embedBaseUrl(): string {
+    return process.env.EMBED_BASE_URL || process.env.LLM_BASE_URL || 'http://127.0.0.1:11434/v1';
+  },
+  get embedModel(): string {
+    return process.env.EMBED_MODEL || 'nomic-embed-text';
+  },
+  /** Where the SQLite search index lives. Always rebuildable from kb/. */
+  get indexPath(): string {
+    return process.env.INDEX_PATH || path.join(config.kbDir, '.index.db');
+  },
   get parakeetBin(): string {
     return process.env.PARAKEET_BIN || 'parakeet-mlx';
   },
