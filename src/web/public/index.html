@@ -1,0 +1,388 @@
+<!-- Chronicle reading room: the single server-rendered shell. Palace map and
+     health are injected by server.ts; the small script below only navigates,
+     asks, and searches. All note HTML arrives pre-escaped from the server. -->
+<title>Chronicle — the reading room</title>
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<style>
+  :root {
+    --paper: #f3eee3;
+    --panel: #fbf8f1;
+    --panel-2: #f6f1e6;
+    --ink: #2a2620;
+    --ink-soft: #6c6151;
+    --ink-faint: #938974;
+    --rule: #e2dac9;
+    --accent: #8a3324;
+    --accent-soft: #b5654f;
+    --shadow: 0 1px 2px rgba(40, 32, 20, 0.05), 0 8px 30px rgba(40, 32, 20, 0.06);
+    --serif: "Iowan Old Style", "Palatino Linotype", Palatino, "Book Antiqua", Georgia, serif;
+    --sans: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Helvetica, Arial, sans-serif;
+    --mono: ui-monospace, "SF Mono", "JetBrains Mono", Menlo, Consolas, monospace;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --paper: #14110c;
+      --panel: #1c1811;
+      --panel-2: #211c14;
+      --ink: #eae2d3;
+      --ink-soft: #ab9f8a;
+      --ink-faint: #7d7361;
+      --rule: #322b20;
+      --accent: #e2a06f;
+      --accent-soft: #cf8a56;
+      --shadow: 0 1px 2px rgba(0, 0, 0, 0.4), 0 10px 34px rgba(0, 0, 0, 0.45);
+    }
+  }
+
+  * { box-sizing: border-box; }
+  html { -webkit-text-size-adjust: 100%; }
+  body {
+    margin: 0;
+    background: var(--paper);
+    color: var(--ink);
+    font-family: var(--serif);
+    line-height: 1.65;
+    -webkit-font-smoothing: antialiased;
+    text-rendering: optimizeLegibility;
+  }
+  a { color: var(--accent); text-decoration: none; }
+  a:hover { text-decoration: underline; text-underline-offset: 2px; }
+  code { font-family: var(--mono); font-size: 0.88em; }
+  ::selection { background: color-mix(in srgb, var(--accent) 24%, transparent); }
+
+  .wrap { max-width: 1180px; margin: 0 auto; padding: 0 clamp(1rem, 4vw, 2.5rem); }
+
+  /* Masthead */
+  header.masthead {
+    border-bottom: 1px solid var(--rule);
+    background: linear-gradient(180deg, var(--panel-2), var(--paper));
+  }
+  .masthead-inner {
+    display: flex; align-items: baseline; justify-content: space-between;
+    gap: 1rem; flex-wrap: wrap; padding: 1.5rem 0 1.3rem;
+  }
+  .wordmark { display: flex; align-items: baseline; gap: 0.7rem; }
+  .wordmark h1 {
+    font-size: clamp(1.7rem, 3vw, 2.3rem); margin: 0; font-weight: 600;
+    letter-spacing: 0.01em;
+  }
+  .wordmark .tag {
+    font-family: var(--sans); font-size: 0.72rem; letter-spacing: 0.18em;
+    text-transform: uppercase; color: var(--ink-faint);
+  }
+  .health {
+    font-family: var(--sans); font-size: 0.74rem; color: var(--ink-soft);
+    text-align: right; line-height: 1.5;
+  }
+  .health .dot {
+    display: inline-block; width: 7px; height: 7px; border-radius: 50%;
+    background: var(--accent); margin-right: 0.4rem; vertical-align: middle;
+  }
+  .health code { font-size: 0.72rem; color: var(--ink); }
+
+  /* Ask band */
+  .ask-band { border-bottom: 1px solid var(--rule); background: var(--paper); }
+  .ask-inner { padding: 2.2rem 0 2rem; }
+  .ask-label {
+    font-family: var(--sans); font-size: 0.72rem; letter-spacing: 0.16em;
+    text-transform: uppercase; color: var(--ink-faint); margin: 0 0 0.7rem;
+  }
+  .ask-row { display: flex; gap: 0.6rem; align-items: stretch; }
+  .ask-row input[type="text"] {
+    flex: 1; font-family: var(--serif); font-size: 1.25rem; color: var(--ink);
+    background: var(--panel); border: 1px solid var(--rule); border-radius: 10px;
+    padding: 0.85rem 1.1rem; box-shadow: var(--shadow); outline: none;
+    transition: border-color 0.15s ease;
+  }
+  .ask-row input[type="text"]::placeholder { color: var(--ink-faint); }
+  .ask-row input[type="text"]:focus { border-color: var(--accent-soft); }
+  .btn {
+    font-family: var(--sans); font-size: 0.9rem; font-weight: 600; cursor: pointer;
+    color: var(--paper); background: var(--accent); border: none; border-radius: 10px;
+    padding: 0 1.4rem; letter-spacing: 0.02em; transition: filter 0.15s ease;
+  }
+  .btn:hover { filter: brightness(1.08); }
+  .btn:disabled { opacity: 0.55; cursor: default; }
+
+  .answer { margin-top: 1.5rem; display: none; }
+  .answer.show { display: block; }
+  .answer-card {
+    background: var(--panel); border: 1px solid var(--rule); border-left: 3px solid var(--accent);
+    border-radius: 10px; padding: 1.3rem 1.6rem; box-shadow: var(--shadow);
+    max-width: 70ch;
+  }
+  .answer-card p { margin: 0 0 0.8rem; font-size: 1.12rem; }
+  .answer-card p:last-child { margin-bottom: 0; }
+  .answer-card a.citation, .answer-card a.wikilink {
+    font-family: var(--sans); font-size: 0.82em; padding: 0.05em 0.35em;
+    background: color-mix(in srgb, var(--accent) 12%, transparent); border-radius: 4px;
+    white-space: nowrap;
+  }
+  .sources {
+    margin-top: 1rem; font-family: var(--sans); font-size: 0.8rem; color: var(--ink-soft);
+    display: flex; flex-wrap: wrap; gap: 0.5rem 0.9rem; align-items: baseline;
+  }
+  .sources .lbl { letter-spacing: 0.14em; text-transform: uppercase; color: var(--ink-faint); }
+  .thinking { font-family: var(--sans); font-size: 0.9rem; color: var(--ink-soft); }
+
+  /* Main grid */
+  .main { display: grid; grid-template-columns: 300px 1fr; gap: clamp(1.5rem, 4vw, 3rem); padding: 2.2rem 0 4rem; }
+  @media (max-width: 800px) { .main { grid-template-columns: 1fr; } }
+
+  aside.map { align-self: start; position: sticky; top: 1.2rem; }
+  .find input {
+    width: 100%; font-family: var(--sans); font-size: 0.9rem; color: var(--ink);
+    background: var(--panel); border: 1px solid var(--rule); border-radius: 8px;
+    padding: 0.55rem 0.75rem; outline: none; margin-bottom: 1.4rem;
+  }
+  .find input:focus { border-color: var(--accent-soft); }
+  .map h2 {
+    font-family: var(--sans); font-size: 0.7rem; letter-spacing: 0.18em;
+    text-transform: uppercase; color: var(--ink-faint); margin: 1.5rem 0 0.6rem;
+    padding-bottom: 0.4rem; border-bottom: 1px solid var(--rule);
+  }
+  .map h2:first-of-type { margin-top: 0; }
+  .map ul { list-style: none; margin: 0; padding: 0; }
+  .map li { margin: 0; }
+  .map li.empty { font-family: var(--sans); font-size: 0.82rem; color: var(--ink-faint); padding: 0.3rem 0; }
+  a.note-link { display: block; padding: 0.5rem 0.6rem; border-radius: 7px; color: var(--ink); }
+  a.note-link:hover { background: var(--panel-2); text-decoration: none; }
+  a.note-link.active { background: var(--panel); box-shadow: inset 2px 0 0 var(--accent); }
+  .note-title { display: block; font-size: 1.02rem; line-height: 1.35; }
+  .note-desc {
+    display: block; font-family: var(--sans); font-size: 0.74rem; color: var(--ink-soft);
+    line-height: 1.4; margin-top: 0.15rem;
+    overflow: hidden; display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical;
+  }
+
+  /* Reader */
+  .reader { min-width: 0; }
+  .reader .prose { max-width: 68ch; }
+  .prose h1 { font-size: clamp(1.8rem, 3.5vw, 2.4rem); font-weight: 600; line-height: 1.15; margin: 0 0 1.1rem; }
+  .prose h2 {
+    font-size: 1.05rem; font-family: var(--sans); font-weight: 700; letter-spacing: 0.06em;
+    text-transform: uppercase; color: var(--ink-soft); margin: 2.2rem 0 0.7rem;
+    padding-bottom: 0.35rem; border-bottom: 1px solid var(--rule);
+  }
+  .prose h3 { font-size: 1.25rem; font-weight: 600; margin: 1.6rem 0 0.5rem; }
+  .prose p { font-size: 1.15rem; margin: 0 0 1.05rem; }
+  .prose ul { padding-left: 1.3rem; margin: 0 0 1.1rem; }
+  .prose li { margin: 0.3rem 0; font-size: 1.1rem; }
+  .prose li.task { list-style: none; margin-left: -1.3rem; }
+  .prose li.task input { margin-right: 0.5rem; accent-color: var(--accent); }
+  .prose pre {
+    background: var(--panel); border: 1px solid var(--rule); border-radius: 10px;
+    padding: 1rem 1.2rem; overflow-x: auto; font-size: 0.92rem; line-height: 1.55;
+  }
+  .prose pre code { color: var(--ink-soft); }
+  .prose a.wikilink {
+    border-bottom: 1px solid color-mix(in srgb, var(--accent) 40%, transparent);
+  }
+  .prose a.citation { font-family: var(--sans); font-size: 0.85em; }
+
+  .reader-meta {
+    font-family: var(--sans); font-size: 0.72rem; letter-spacing: 0.14em;
+    text-transform: uppercase; color: var(--ink-faint); margin-bottom: 1rem;
+  }
+  .badge {
+    display: inline-block; padding: 0.15em 0.6em; border: 1px solid var(--rule);
+    border-radius: 999px; color: var(--ink-soft);
+  }
+
+  .welcome { max-width: 60ch; color: var(--ink-soft); }
+  .welcome h2 {
+    font-family: var(--serif); font-size: 1.6rem; text-transform: none; letter-spacing: 0;
+    color: var(--ink); border: none; padding: 0; margin: 0 0 0.8rem; font-weight: 600;
+  }
+  .welcome p { font-size: 1.12rem; }
+
+  .results-head {
+    font-family: var(--sans); font-size: 0.78rem; letter-spacing: 0.1em; text-transform: uppercase;
+    color: var(--ink-faint); margin-bottom: 1rem;
+  }
+  .hit {
+    display: block; padding: 0.9rem 1.1rem; margin-bottom: 0.7rem; border-radius: 10px;
+    background: var(--panel); border: 1px solid var(--rule); color: var(--ink);
+  }
+  .hit:hover { text-decoration: none; border-color: var(--accent-soft); }
+  .hit .hit-file { font-family: var(--sans); font-size: 0.72rem; color: var(--ink-faint); letter-spacing: 0.06em; }
+  .hit .hit-text { margin-top: 0.25rem; font-size: 1.05rem; line-height: 1.45; }
+  .banner {
+    background: var(--panel); border: 1px solid var(--rule); border-left: 3px solid var(--accent);
+    border-radius: 10px; padding: 1rem 1.3rem; font-family: var(--sans); font-size: 0.95rem;
+    color: var(--ink-soft);
+  }
+  .banner code { background: var(--panel-2); padding: 0.1em 0.4em; border-radius: 4px; color: var(--ink); }
+</style>
+
+<header class="masthead">
+  <div class="wrap masthead-inner">
+    <div class="wordmark">
+      <h1>Chronicle</h1>
+      <span class="tag">the reading room</span>
+    </div>
+    <div class="health">
+      <div><span class="dot"></span><!--HEALTH--></div>
+      <div>answering with <code><!--PROVIDER--></code></div>
+    </div>
+  </div>
+</header>
+
+<section class="ask-band">
+  <div class="wrap ask-inner">
+    <p class="ask-label">Ask the archive</p>
+    <form id="ask-form" class="ask-row" autocomplete="off">
+      <input id="ask-input" type="text" name="q" placeholder="What did we decide about storage?" />
+      <button class="btn" id="ask-btn" type="submit">Ask</button>
+    </form>
+    <div id="answer" class="answer">
+      <div class="answer-card" id="answer-body"></div>
+      <div class="sources" id="answer-sources"></div>
+    </div>
+  </div>
+</section>
+
+<div class="wrap main">
+  <aside class="map">
+    <form class="find" onsubmit="return false">
+      <input id="find-input" type="text" placeholder="Search the palace…" />
+    </form>
+    <h2>Topics</h2>
+    <ul id="topics"><!--TOPICS--></ul>
+    <h2>Meetings</h2>
+    <ul id="meetings"><!--MEETINGS--></ul>
+  </aside>
+
+  <main class="reader" id="reader">
+    <div class="welcome">
+      <h2>A palace of what was said.</h2>
+      <p>Every meeting is transcribed, distilled into atomic facts, and cross-linked
+        into the topics it touches. Ask a question above to have the archive answer
+        with citations, or open any note from the map to read it whole.</p>
+    </div>
+  </main>
+</div>
+
+<script>
+  const reader = document.getElementById('reader');
+  const answerWrap = document.getElementById('answer');
+  const answerBody = document.getElementById('answer-body');
+  const answerSources = document.getElementById('answer-sources');
+
+  function esc(s) {
+    return String(s).replace(/[&<>"']/g, (c) =>
+      ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+  }
+
+  function setActive(file) {
+    document.querySelectorAll('a.note-link.active').forEach((a) => a.classList.remove('active'));
+    if (file) {
+      const link = document.querySelector('a.note-link[data-note="' + CSS.escape(file) + '"]');
+      if (link) link.classList.add('active');
+    }
+  }
+
+  async function loadNote(file) {
+    reader.innerHTML = '<p class="thinking">Opening…</p>';
+    try {
+      const res = await fetch('/api/notes/' + file.split('/').map(encodeURIComponent).join('/'));
+      const data = await res.json();
+      if (!res.ok) {
+        reader.innerHTML = '<div class="banner">' + esc(data.message || 'Could not open that note.') + '</div>';
+        return;
+      }
+      reader.innerHTML =
+        '<div class="reader-meta"><span class="badge">' + esc(data.type || 'note') + '</span> · ' + esc(data.file) + '</div>' +
+        '<article class="prose">' + data.html + '</article>';
+      setActive(data.file);
+      window.scrollTo({ top: 0, behavior: 'smooth' });
+    } catch (e) {
+      reader.innerHTML = '<div class="banner">Could not reach the server.</div>';
+    }
+  }
+
+  // Hash router: every note link and wiki-link is an href="#/note/<file>".
+  function route() {
+    const m = location.hash.match(/^#\/note\/(.+)$/);
+    if (m) loadNote(decodeURIComponent(m[1]));
+    else setActive(null);
+  }
+  window.addEventListener('hashchange', route);
+
+  // Ask → /api/recall
+  const askForm = document.getElementById('ask-form');
+  const askInput = document.getElementById('ask-input');
+  const askBtn = document.getElementById('ask-btn');
+  askForm.addEventListener('submit', async (e) => {
+    e.preventDefault();
+    const question = askInput.value.trim();
+    if (!question) return;
+    askBtn.disabled = true;
+    askBtn.textContent = 'Asking…';
+    answerWrap.classList.add('show');
+    answerBody.innerHTML = '<p class="thinking">Consulting the archive…</p>';
+    answerSources.innerHTML = '';
+    try {
+      const res = await fetch('/api/recall', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ question }),
+      });
+      const data = await res.json();
+      if (!res.ok) {
+        answerBody.innerHTML = '<p>' + esc(data.message || 'The archive could not answer.') + '</p>';
+        return;
+      }
+      answerBody.innerHTML = data.answerHtml || ('<p>' + esc(data.answer) + '</p>');
+      const files = [...new Set((data.hits || []).map((h) => h.file))];
+      if (files.length) {
+        answerSources.innerHTML = '<span class="lbl">Sources</span>' +
+          files.map((f) => '<a href="#/note/' + esc(f) + '">' + esc(f.replace(/\.md$/, '')) + '</a>').join('');
+      }
+    } catch (err) {
+      answerBody.innerHTML = '<p>Could not reach the server.</p>';
+    } finally {
+      askBtn.disabled = false;
+      askBtn.textContent = 'Ask';
+    }
+  });
+
+  // Quick find → /api/search, results render in the reader.
+  const findInput = document.getElementById('find-input');
+  let findTimer = null;
+  let findSeq = 0;
+  findInput.addEventListener('input', () => {
+    clearTimeout(findTimer);
+    const q = findInput.value.trim();
+    if (!q) { route(); return; }
+    findTimer = setTimeout(() => runSearch(q), 220);
+  });
+  async function runSearch(q) {
+    const seq = ++findSeq;
+    reader.innerHTML = '<p class="thinking">Searching…</p>';
+    try {
+      const res = await fetch('/api/search?q=' + encodeURIComponent(q));
+      const data = await res.json();
+      if (seq !== findSeq) return; // a newer keystroke already won
+      if (!res.ok) {
+        reader.innerHTML = '<div class="banner">' + esc(data.message || 'Search failed.') + '</div>';
+        return;
+      }
+      const hits = data.hits || [];
+      if (!hits.length) {
+        reader.innerHTML = '<div class="results-head">No matches for "' + esc(q) + '"</div>';
+        return;
+      }
+      reader.innerHTML = '<div class="results-head">' + hits.length + ' result' + (hits.length === 1 ? '' : 's') +
+        ' for "' + esc(q) + '"</div>' +
+        hits.map((h) =>
+          '<a class="hit" href="#/note/' + esc(h.file) + '">' +
+          '<span class="hit-file">' + esc((h.noteTitle || h.file) + ' · ' + h.file.replace(/\.md$/, '')) + '</span>' +
+          '<span class="hit-text">' + esc(h.text) + '</span></a>').join('');
+    } catch (e) {
+      reader.innerHTML = '<div class="banner">Could not reach the server.</div>';
+    }
+  }
+
+  if (location.hash) route();
+</script>
