@@ -5,6 +5,7 @@ import {
   GatewayIntentBits,
   SlashCommandBuilder,
   type SendableChannels,
+  type VoiceBasedChannel,
 } from 'discord.js';
 import path from 'node:path';
 import { config } from './config.js';
@@ -13,15 +14,100 @@ import { processMeeting } from './pipeline.js';
 import { recall } from './recall.js';
 import { RecordingSession } from './recorder.js';
 import { assertParakeetReady } from './transcribe.js';
+import { shouldAutoStart, shouldAutoStop } from './voice-policy.js';
 
 const sessions = new Map<string, RecordingSession>(); // guildId -> active session
+// Guilds whose session is being set up right now. RecordingSession.start awaits
+// the voice connection, so two people joining at once could otherwise both pass
+// the "not recording yet" check and start two sessions for one channel.
+const startingGuilds = new Set<string>();
+
+/** Count non-bot members in a voice channel. The bot must never count itself. */
+function humanCount(channel: VoiceBasedChannel): number {
+  return channel.members.filter((m) => !m.user.bot).size;
+}
+
+/**
+ * Stop a session, run the pipeline, and report back into `channel`. Shared by
+ * the manual `/record stop` and the automatic "everyone left" path so both file
+ * meetings identically.
+ */
+async function finishAndFile(
+  session: RecordingSession,
+  channel: SendableChannels | null,
+): Promise<void> {
+  const say = async (msg: string) => channel?.send(msg).catch(() => {});
+  const { segments, speakers, durationMs } = await session.stop();
+
+  try {
+    const result = await processMeeting(segments, speakers, durationMs, (status) => void say(status));
+    if (!result) {
+      await say('No usable speech was captured, so nothing was added to the knowledge base.');
+      return;
+    }
+    const { summary, written } = result;
+    const embed = new EmbedBuilder()
+      .setTitle(`📚 ${summary.title}`)
+      .setDescription(summary.summary.slice(0, 4000))
+      .addFields(
+        summary.decisions.length
+          ? [{ name: 'Decisions', value: summary.decisions.map((d) => `• ${d}`).join('\n').slice(0, 1024) }]
+          : [],
+      )
+      .addFields(
+        summary.action_items.length
+          ? [{
+              name: 'Action items',
+              value: summary.action_items.map((a) => `• **${a.owner}**: ${a.task}`).join('\n').slice(0, 1024),
+            }]
+          : [],
+      )
+      .setFooter({
+        text: `Filed as ${path.relative(process.cwd(), written.meetingPath)} · ${written.topicPaths.length} topic(s) updated`,
+      });
+    await channel?.send({ embeds: [embed] });
+  } catch (err) {
+    console.error('Meeting pipeline failed:', err);
+    await say(`⚠️ Failed to process the meeting: ${err instanceof Error ? err.message : err}`);
+  }
+}
+
+/** Join a voice channel and start recording it. No-op if already recording/starting the guild. */
+async function autoStartRecording(channel: VoiceBasedChannel): Promise<void> {
+  const guildId = channel.guild.id;
+  if (sessions.has(guildId) || startingGuilds.has(guildId)) return;
+
+  startingGuilds.add(guildId);
+  try {
+    const session = await RecordingSession.start(channel, config.sessionsDir, async (userId) => {
+      const m = await channel.guild.members.fetch(userId);
+      return m.displayName;
+    });
+    sessions.set(guildId, session);
+    // Consent matters more here than for a manual start: people are recorded the
+    // moment they join, without typing anything. Announce it in the voice
+    // channel's own text chat, where they'll see it.
+    await (channel as unknown as SendableChannels)
+      .send(
+        `🔴 **Recording ${channel.name}.** Everyone here is being recorded — ` +
+          `it stops and files itself automatically when the last person leaves.`,
+      )
+      .catch(() => {});
+  } catch (err) {
+    console.error('Auto-start recording failed:', err);
+  } finally {
+    startingGuilds.delete(guildId);
+  }
+}
 
 const commands = [
   new SlashCommandBuilder()
     .setName('record')
     .setDescription('Record the current voice channel into the knowledge base')
     .addSubcommand((sub) =>
-      sub.setName('start').setDescription('Join your voice channel and start recording'),
+      sub
+        .setName('start')
+        .setDescription('Force-start recording (Chronicle already auto-joins when someone enters a call)'),
     )
     .addSubcommand((sub) =>
       sub
@@ -52,6 +138,54 @@ client.once('clientReady', async () => {
   }
   console.log(`Chronicle is ready as ${client.user!.tag}`);
   console.log(`Distilling and answering with ${describeProvider()}`);
+});
+
+/**
+ * Auto-record: join when a human enters a voice channel, stop and file when the
+ * last one leaves. `/record start|stop` still work as manual overrides.
+ *
+ * Fires on every voice change (join, leave, move, mute, deafen). We act only on
+ * channel changes, and route the two channels involved through the pure
+ * decisions in voice-policy.ts.
+ */
+client.on('voiceStateUpdate', async (oldState, newState) => {
+  try {
+    if (oldState.channelId === newState.channelId) return; // mute/deafen/etc — not a move
+    const guildId = (newState.guild ?? oldState.guild).id;
+
+    // Someone left oldState.channel — if it's the room we're recording and it's
+    // now empty of humans, wrap up. Done first so a move (leave A → join B) can
+    // free the guild before the join check below.
+    const session = sessions.get(guildId);
+    if (session && oldState.channelId && oldState.channel) {
+      const decision = shouldAutoStop({
+        leftChannelId: oldState.channelId,
+        recordingChannelId: session.voiceChannelId,
+        humansRemaining: humanCount(oldState.channel),
+      });
+      if (decision) {
+        sessions.delete(guildId);
+        // Fire-and-forget: processing takes ~seconds and must not block a
+        // simultaneous join from starting a fresh session.
+        void finishAndFile(session, oldState.channel as unknown as SendableChannels);
+      }
+    }
+
+    // Someone joined newState.channel — start recording if we aren't already.
+    if (
+      newState.channel &&
+      shouldAutoStart({
+        joinerIsBot: newState.member?.user.bot ?? false,
+        channelId: newState.channelId,
+        alreadyRecording: sessions.has(guildId) || startingGuilds.has(guildId),
+        humansInChannel: humanCount(newState.channel),
+      })
+    ) {
+      await autoStartRecording(newState.channel);
+    }
+  } catch (err) {
+    console.error('voiceStateUpdate handler failed:', err);
+  }
 });
 
 async function handleRecordStart(interaction: ChatInputCommandInteraction): Promise<void> {
@@ -93,45 +227,9 @@ async function handleRecordStop(interaction: ChatInputCommandInteraction): Promi
   sessions.delete(interaction.guildId!);
 
   await interaction.reply('⏹️ Recording stopped. Processing the meeting…');
-  const { segments, speakers, durationMs } = await session.stop();
-
   // Long meetings can take a while to transcribe; the interaction token only
   // lives 15 minutes, so all further updates go through the channel directly.
-  const channel = interaction.channel as SendableChannels | null;
-  const say = async (msg: string) => channel?.send(msg).catch(() => {});
-
-  try {
-    const result = await processMeeting(segments, speakers, durationMs, (status) => void say(status));
-    if (!result) {
-      await say('No usable speech was captured, so nothing was added to the knowledge base.');
-      return;
-    }
-
-    const { summary, written } = result;
-    const embed = new EmbedBuilder()
-      .setTitle(`📚 ${summary.title}`)
-      .setDescription(summary.summary.slice(0, 4000))
-      .addFields(
-        summary.decisions.length
-          ? [{ name: 'Decisions', value: summary.decisions.map((d) => `• ${d}`).join('\n').slice(0, 1024) }]
-          : [],
-      )
-      .addFields(
-        summary.action_items.length
-          ? [{
-              name: 'Action items',
-              value: summary.action_items.map((a) => `• **${a.owner}**: ${a.task}`).join('\n').slice(0, 1024),
-            }]
-          : [],
-      )
-      .setFooter({
-        text: `Filed as ${path.relative(process.cwd(), written.meetingPath)} · ${written.topicPaths.length} topic(s) updated`,
-      });
-    await channel?.send({ embeds: [embed] });
-  } catch (err) {
-    console.error('Meeting pipeline failed:', err);
-    await say(`⚠️ Failed to process the meeting: ${err instanceof Error ? err.message : err}`);
-  }
+  await finishAndFile(session, interaction.channel as SendableChannels | null);
 }
 
 async function handleRecordStatus(interaction: ChatInputCommandInteraction): Promise<void> {

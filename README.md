@@ -7,8 +7,8 @@ memory-palace style repository of small, linked markdown notes.
 ## How it works
 
 ```
-/record start ──▶ per-speaker Opus streams ──▶ PCM on disk
-/record stop  ──▶ ffmpeg ──▶ Parakeet MLX (local) ──▶ speaker-attributed transcript
+someone joins call ──▶ per-speaker Opus streams ──▶ PCM on disk
+everyone leaves     ──▶ ffmpeg ──▶ Parakeet MLX (local) ──▶ speaker-attributed transcript
                                   │
                                   ▼
                      a local LLM (Ollama) distills the transcript
@@ -100,10 +100,15 @@ one self-contained sentence with a backlink to the meeting it came from. Make
 
 ## Commands
 
+**Recording is automatic.** The bot joins a voice channel the moment a person
+enters it (announcing itself, for consent), and when the last person leaves it
+stops, transcribes, distills, and files the meeting on its own. Nobody has to
+run a command. The `/record` commands are manual overrides for the exceptions.
+
 | Command | What it does |
 | --- | --- |
-| `/record start` | Joins your voice channel and starts recording (announces itself in-channel) |
-| `/record stop` | Stops, transcribes, distills locally, files the meeting into `kb/`, posts the summary |
+| `/record start` | Force-start recording now (rarely needed — auto-join covers the normal case) |
+| `/record stop` | Wrap up and file the current recording immediately, before the channel empties |
 | `/record status` | Shows recording duration and speakers so far |
 | `/recall query:<text>` | Answers a question over the knowledge base, citing the notes it used |
 
