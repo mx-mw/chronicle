@@ -31,18 +31,37 @@ the Discord side is fully configured and ready to go. One thing is unverified
 
 ## Needs verification
 
-**Parakeet transcription accuracy has not been confirmed.** The first-run
-model download from Hugging Face hung indefinitely using the default
-`hf_xet` accelerated-transfer backend (connections went idle, zero bytes/sec,
-no error — just stalled). Worked around by killing it and retrying with
-`HF_HUB_DISABLE_XET=1` (falls back to plain HTTPS), which was progressing
-normally (~50MB downloaded, still growing) when this session ended.
+**Parakeet transcription accuracy has not been confirmed — the model still
+isn't fully downloaded.** Two failed attempts so far:
+
+1. First attempt hung indefinitely on the default `hf_xet`
+   accelerated-transfer backend (connections went idle, zero bytes/sec, no
+   error — just stalled at ~64MB).
+2. Retried with `HF_HUB_DISABLE_XET=1` (falls back to plain HTTPS). This one
+   actually made progress — climbed steadily to ~1GB over about 7 minutes —
+   but then hit repeated read timeouts on `model.safetensors` near the end
+   (`The read operation timed out`, tried to resume twice, still failed) and
+   errored out with no `config.json` written. Whatever partial blob existed
+   was cleaned up on failure, so **a fresh attempt starts over from 0**, it
+   does not resume from ~1GB.
+
+This looks like flaky/rate-limited network to Hugging Face rather than
+anything wrong with Chronicle's code — `parakeet-mlx` itself printed "You
+are sending unauthenticated requests to the HF Hub... set HF_TOKEN for
+higher rate limits and faster downloads", which may be the actual fix
+(anonymous HF downloads are rate-limited and more prone to being cut off).
 
 To finish verifying:
 ```sh
 export PATH="$HOME/.local/bin:$PATH"
-ps aux | grep parakeet-mlx        # check if the retry is still running/finished
-du -sh ~/.cache/huggingface/hub/models--mlx-community--parakeet-tdt-0.6b-v3
+export HF_HUB_DISABLE_XET=1
+export HF_TOKEN=...   # a free HF account token may fix the mid-download timeouts
+parakeet-mlx --help   # trigger nothing; just confirm the binary works
+# Then run a real transcription (below) to trigger the model download and
+# watch it to completion — it took ~7 min to reach 1GB last time, so budget
+# 10-15 min and don't assume a silent multi-minute gap means it's hung;
+# check `du -sh ~/.cache/huggingface/hub/models--mlx-community--parakeet-tdt-0.6b-v3`
+# growing over 30s before concluding it stalled.
 ```
 Once the model is fully cached, confirm actual transcription quality — a
 quick way, since macOS has a TTS voice built in:
