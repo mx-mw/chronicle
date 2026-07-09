@@ -1,4 +1,5 @@
 import { execFile } from 'node:child_process';
+import { existsSync } from 'node:fs';
 import { readFile, rm, stat } from 'node:fs/promises';
 import path from 'node:path';
 import { promisify } from 'node:util';
@@ -6,6 +7,17 @@ import { config } from './config.js';
 import type { Segment } from './recorder.js';
 
 const run = promisify(execFile);
+
+/**
+ * Raised when the ASR backend failed to produce a transcript for a segment.
+ * Distinct from "the segment contained no speech" — see transcribeSession.
+ */
+export class TranscriptionError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = 'TranscriptionError';
+  }
+}
 
 // 48kHz * 2ch * 2 bytes = 192,000 bytes/sec of raw PCM. Segments shorter than
 // ~0.4s are keyboard taps and breaths that produce garbage transcriptions.
@@ -46,7 +58,10 @@ async function pcmToWav(pcmPath: string): Promise<string> {
 export async function transcribeWav(wavPath: string): Promise<string> {
   const outDir = path.dirname(wavPath);
   const txtPath = path.join(outDir, `${path.basename(wavPath, path.extname(wavPath))}.txt`);
-  await run(
+  // parakeet-mlx catches per-file errors internally, prints "transcription
+  // complete", and still exits 0 — so a zero exit code proves nothing. The
+  // only trustworthy signal that it worked is the output file appearing.
+  const { stdout, stderr } = await run(
     config.parakeetBin,
     [
       wavPath,
@@ -56,6 +71,17 @@ export async function transcribeWav(wavPath: string): Promise<string> {
     ],
     { maxBuffer: 64 * 1024 * 1024 },
   );
+
+  if (!existsSync(txtPath)) {
+    const detail = `${stderr}\n${stdout}`.trim().split('\n').slice(0, 6).join('\n');
+    throw new TranscriptionError(
+      `${config.parakeetBin} wrote no transcript for ${path.basename(wavPath)} (it exits 0 even when the ` +
+        `model fails to run).\n${detail}\n\n` +
+        `A Metal "unsupported deferred-static-alloca-size" error here means MLX cannot compile its GPU ` +
+        `kernels on this machine. Pin an older MLX: uv tool install --force parakeet-mlx --with "mlx==0.31.2"`,
+    );
+  }
+
   try {
     const text = await readFile(txtPath, 'utf8');
     return text.replace(/\s+/g, ' ').trim();
@@ -85,6 +111,9 @@ export async function transcribeSession(
 ): Promise<{ transcript: string; lines: TranscriptLine[] }> {
   const lines: TranscriptLine[] = [];
   let done = 0;
+  let attempted = 0;
+  let firstFailure: unknown;
+  let failures = 0;
 
   for (const segment of segments) {
     done += 1;
@@ -92,6 +121,7 @@ export async function transcribeSession(
       const { size } = await stat(segment.pcmPath);
       if (size < MIN_PCM_BYTES) continue;
 
+      attempted += 1;
       const wavPath = await pcmToWav(segment.pcmPath);
       const text = await transcribeWav(wavPath);
       if (!text) continue;
@@ -102,10 +132,28 @@ export async function transcribeSession(
         text,
       });
     } catch (err) {
+      failures += 1;
+      firstFailure ??= err;
       console.error(`Failed to transcribe ${segment.pcmPath}:`, err);
     } finally {
       onProgress?.(done, segments.length);
     }
+  }
+
+  // If every segment we actually tried to transcribe blew up, the backend is
+  // broken. Surfacing that as an empty transcript would tell the user "no
+  // usable speech was captured" — blaming them for a toolchain failure, and
+  // silently discarding a real meeting.
+  if (attempted > 0 && failures === attempted) {
+    throw new TranscriptionError(
+      `All ${attempted} audio segment(s) failed to transcribe — the audio was recorded, but the ASR ` +
+        `backend is not working. Root cause:\n\n${
+          firstFailure instanceof Error ? firstFailure.message : String(firstFailure)
+        }`,
+    );
+  }
+  if (failures > 0) {
+    console.warn(`${failures}/${attempted} segments failed to transcribe; the transcript is incomplete.`);
   }
 
   const transcript = lines
