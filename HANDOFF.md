@@ -1,8 +1,9 @@
 # Handoff
 
 Status as of this session: Chronicle runs fully offline (no cloud API calls) and
-the Discord side is fully configured and ready to go. One thing is unverified
-— see "Needs verification" below before you trust it in production.
+the Discord side is fully configured and ready to go. The transcription
+question left open by the previous session is now resolved — see "Resolved"
+below. Discord itself is still untested end-to-end.
 
 ## What's done
 
@@ -29,36 +30,46 @@ the Discord side is fully configured and ready to go. One thing is unverified
   (scopes `bot` + `applications.commands`; perms View Channels / Send
   Messages / Connect).
 
-## Needs verification
+## Resolved
 
-**Parakeet transcription accuracy has not been confirmed.** The first-run
-model download from Hugging Face hung indefinitely using the default
-`hf_xet` accelerated-transfer backend (connections went idle, zero bytes/sec,
-no error — just stalled). Worked around by killing it and retrying with
-`HF_HUB_DISABLE_XET=1` (falls back to plain HTTPS), which was progressing
-normally (~50MB downloaded, still growing) when this session ended.
+**Parakeet transcription accuracy: confirmed good.** Word-perfect on the macOS
+`say` test, ~5s for a 10s clip once the model is cached. The `HF_HUB_DISABLE_XET=1`
+workaround for the stalled first-run download works and is now in the README.
 
-To finish verifying:
+**But it needed an MLX pin.** On an M5 / macOS 26.1, `mlx==0.32.0` cannot compile
+its Metal GPU kernels — every transcription dies with `unsupported
+deferred-static-alloca-size` inside `mpp::tensor_ops::__matmul2d` (MLX's new
+tensor-core GEMM path). 0.32.0 is the latest release, so there is nothing to
+upgrade to; pin backwards instead:
+
 ```sh
-export PATH="$HOME/.local/bin:$PATH"
-ps aux | grep parakeet-mlx        # check if the retry is still running/finished
-du -sh ~/.cache/huggingface/hub/models--mlx-community--parakeet-tdt-0.6b-v3
+uv tool install --force parakeet-mlx --with "mlx==0.31.2"
 ```
-Once the model is fully cached, confirm actual transcription quality — a
-quick way, since macOS has a TTS voice built in:
-```sh
-say -o test.aiff "some sentence"; ffmpeg -y -i test.aiff -ar 16000 -ac 1 test.wav
-parakeet-mlx test.wav --model mlx-community/parakeet-tdt-0.6b-v3 --output-format txt
-cat test.txt   # should roughly match what you said
-```
-If `hf_xet` hangs again on a fresh machine, set `HF_HUB_DISABLE_XET=1` in
-the environment before first run (or `uv tool install parakeet-mlx` env, or
-just export it in the shell that runs `npm run dev` / `npm run ingest`).
 
-Also not yet done: a real end-to-end test through Discord itself (`/record
-start` → talk → `/record stop`) — everything up to that point has only been
-tested by calling `transcribeWav()` / `summarizeMeeting()` directly with
-synthetic input, not through the live bot.
+Worth re-testing on the next MLX release — this is an upstream bug, not ours.
+
+**A real bug fell out of that.** `parakeet-mlx` catches per-file errors
+internally, prints "transcription complete", writes no output file, and still
+**exits 0**. `transcribeWav()` only threw on a nonzero exit, so a totally broken
+ASR backend was swallowed segment-by-segment and reported to the user as *"No
+usable speech was captured"* — blaming them for a toolchain failure while
+silently discarding a real meeting. Fixed: the output file's existence is now
+the success signal, and `transcribeSession()` throws a `TranscriptionError` when
+every attempted segment fails, instead of returning an empty transcript. The
+error names the Metal failure and prints the pin command.
+
+**Pipeline verified end-to-end** (audio → Parakeet → Ollama → `kb/`) via
+`npm run ingest` on a synthetic meeting: 14.7s total, correct decisions, owned
+action items, and open questions extracted. Both the success and failure paths
+were tested (the latter with a stub binary that mimics the exit-0-write-nothing
+behaviour).
+
+## Still needs verification
+
+A real end-to-end test through Discord itself (`/record start` → talk →
+`/record stop`). Everything up to the bot boundary is now exercised, but the
+voice-receive path has still only been tested via `npm run ingest`, not a live
+call.
 
 ## Architecture notes
 

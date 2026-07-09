@@ -59,6 +59,18 @@ one self-contained sentence with a backlink to the meeting it came from. Make
    `parakeet-mlx` downloads its model (`mlx-community/parakeet-tdt-0.6b-v3`,
    ~0.6B params) from Hugging Face automatically on first transcription.
 
+   **If transcription produces nothing on an M5 Mac**, MLX 0.32.0 fails to
+   compile its Metal GPU kernels (`unsupported deferred-static-alloca-size`).
+   Pin the previous release:
+
+   ```sh
+   uv tool install --force parakeet-mlx --with "mlx==0.31.2"
+   ```
+
+   **If the first-run model download hangs** at zero bytes/sec with no error,
+   Hugging Face's accelerated-transfer backend is stalling. Fall back to plain
+   HTTPS by exporting `HF_HUB_DISABLE_XET=1` before the first transcription.
+
 3. **Pull a model for distillation** and keep Ollama running alongside the
    bot:
 
