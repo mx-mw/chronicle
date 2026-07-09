@@ -3,6 +3,7 @@ import { existsSync } from 'node:fs';
 import path from 'node:path';
 import { config } from './config.js';
 import type { MeetingSummary } from './summarize.js';
+import type { SourceKind } from './sources/index.js';
 
 /**
  * The knowledge base is a memory-palace style markdown repository:
@@ -50,20 +51,60 @@ export interface WrittenMeeting {
   topicPaths: string[];
 }
 
-export async function writeMeeting(
+export interface SourceMeta {
+  date: string;
+  kind: SourceKind;
+  /** URL, file path, or "discord:<channel>" — where the source came from. */
+  origin: string;
+  /** Speakers (meeting) or author(s) (article/pdf). */
+  attribution?: string[];
+  durationMinutes?: number;
+}
+
+/**
+ * Build the one-line metadata banner under a note's title. A meeting shows
+ * participants and duration; an article has neither, so it shows author and
+ * source instead. Only render the facts that exist for this kind.
+ */
+function metaLine(meta: SourceMeta): string {
+  if (meta.kind === 'meeting') {
+    return (
+      `**Date:** ${meta.date} · **Duration:** ~${meta.durationMinutes ?? '?'} min · ` +
+      `**Participants:** ${(meta.attribution ?? []).join(', ') || 'unknown'}`
+    );
+  }
+  const parts = [`**Date:** ${meta.date}`];
+  if (meta.attribution?.length) parts.push(`**By:** ${meta.attribution.join(', ')}`);
+  if (meta.durationMinutes) parts.push(`**Duration:** ~${meta.durationMinutes} min`);
+  parts.push(`**Source:** ${meta.origin}`);
+  return parts.join(' · ');
+}
+
+/**
+ * File a distilled source into the knowledge base.
+ *
+ * KB-layout choice: every distilled note — meeting or article or PDF — goes into
+ * kb/meetings/, and the real kind is recorded in the `type:` frontmatter, not in
+ * the directory name. The reason is a hard constraint, not aesthetics: store.ts
+ * (which indexes the KB for `/recall`) only walks kb/topics/ and kb/meetings/. A
+ * new kb/sources/ directory would be invisible to search, and an unsearchable
+ * note defeats the whole point of the topics spine. So the directory name is a
+ * historical label; `type:` is the source of truth for what a note actually is.
+ */
+export async function writeSource(
   summary: MeetingSummary,
-  transcript: string,
-  meta: { date: string; participants: string[]; durationMinutes: number },
+  rawText: string,
+  meta: SourceMeta,
 ): Promise<WrittenMeeting> {
   await ensureDirs();
-  const meetingName = `${meta.date}-${slugify(summary.slug)}`;
+  const noteName = `${meta.date}-${slugify(summary.slug)}`;
 
-  // 1. Raw transcript, for provenance.
-  const transcriptPath = path.join(config.kbDir, 'transcripts', `${meetingName}.md`);
+  // 1. Raw source text, for provenance.
+  const transcriptPath = path.join(config.kbDir, 'transcripts', `${noteName}.md`);
   await writeFile(
     transcriptPath,
-    frontmatter(meetingName, `Raw transcript: ${summary.title}`, 'transcript') +
-      `# Transcript: ${summary.title}\n\n\`\`\`\n${transcript}\n\`\`\`\n`,
+    frontmatter(noteName, `Raw source: ${summary.title}`, 'transcript') +
+      `# Source text: ${summary.title}\n\n\`\`\`\n${rawText}\n\`\`\`\n`,
   );
 
   // 2. Topic notes accumulate facts append-style, newest last, each with a backlink.
@@ -87,19 +128,18 @@ export async function writeMeeting(
         `# ${facts[0].topic_title}\n\n${facts[0].topic_description}\n\n## Log\n`;
     }
     for (const fact of facts) {
-      content += `- ${fact.fact} — [[meetings/${meetingName}]] (${meta.date})\n`;
+      content += `- ${fact.fact} — [[meetings/${noteName}]] (${meta.date})\n`;
     }
     await writeFile(topicPath, content);
     topicPaths.push(topicPath);
   }
 
-  // 3. The meeting note itself.
-  const meetingPath = path.join(config.kbDir, 'meetings', `${meetingName}.md`);
+  // 3. The source note itself.
+  const notePath = path.join(config.kbDir, 'meetings', `${noteName}.md`);
   let note =
-    frontmatter(meetingName, summary.title, 'meeting') +
+    frontmatter(noteName, summary.title, meta.kind) +
     `# ${summary.title}\n\n` +
-    `**Date:** ${meta.date} · **Duration:** ~${meta.durationMinutes} min · ` +
-    `**Participants:** ${meta.participants.join(', ') || 'unknown'}\n\n` +
+    `${metaLine(meta)}\n\n` +
     `${summary.summary}\n`;
 
   if (summary.decisions.length) {
@@ -116,12 +156,27 @@ export async function writeMeeting(
   note += `\n## Topics touched\n${[...factsByTopic.keys()]
     .map((slug) => `- [[topics/${slug}]]`)
     .join('\n')}\n`;
-  note += `\n## Provenance\n- [[transcripts/${meetingName}]]\n`;
-  await writeFile(meetingPath, note);
+  note += `\n## Provenance\n- [[transcripts/${noteName}]]\n`;
+  await writeFile(notePath, note);
 
   await rebuildIndex();
   await refreshSearchIndex();
-  return { meetingPath, transcriptPath, topicPaths };
+  return { meetingPath: notePath, transcriptPath, topicPaths };
+}
+
+/** Backwards-compatible wrapper for the Discord/meeting path. */
+export async function writeMeeting(
+  summary: MeetingSummary,
+  transcript: string,
+  meta: { date: string; participants: string[]; durationMinutes: number },
+): Promise<WrittenMeeting> {
+  return writeSource(summary, transcript, {
+    date: meta.date,
+    kind: 'meeting',
+    origin: 'discord',
+    attribution: meta.participants,
+    durationMinutes: meta.durationMinutes,
+  });
 }
 
 /**
