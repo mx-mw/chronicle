@@ -97,7 +97,7 @@ web UI.
   are bounded.
 - Parakeet processes a session batch instead of reloading the model once per
   segment and distinguishes silence from backend failure.
-- CI runs the full check on Node 22.12 and Node 24.
+- CI runs the full check on Node 22.13 and Node 24.
 - `undici` is a pinned direct dependency for DNS-pinned article fetches;
   `npm audit` is clean.
 
@@ -120,7 +120,7 @@ point for any production archive change.
 
 ## Start checklist
 
-1. Install Node 22.12+, ffmpeg, Parakeet MLX, Ollama, and optionally yt-dlp.
+1. Install Node 22.13+, ffmpeg, Parakeet MLX, Ollama, and optionally yt-dlp.
    Known issue (2026-07-09): the first-run Parakeet model download from
    Hugging Face is flaky when anonymous — the `hf_xet` backend can stall at
    zero bytes/sec, and the plain-HTTPS fallback (`HF_HUB_DISABLE_XET=1`) has
@@ -196,7 +196,7 @@ been automated or performed during the code audit.
 - Capture preview has been exercised with synthetic UI data, not a live model
   and every extractor combination.
 - Node 22 prints an experimental warning for the built-in SQLite module. The
-  tested API is available and CI covers Node 22.12 and Node 24.
+  tested API is available without a runtime flag from Node 22.13, and CI covers Node 22.13 and Node 24.
 - The project has no declared open-source license. Add one only after Ethan and
   Max choose the intended ownership and distribution terms.
 
