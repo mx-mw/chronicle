@@ -6,6 +6,13 @@ import path from 'node:path';
 import test from 'node:test';
 import { persistRawCapture, stageSourceDraft, workspaceRoot } from '../kb.js';
 import {
+  createSessionManifest,
+  ensurePrivateDirectory as ensureSessionDirectory,
+  manifestPath,
+  writeJsonAtomic,
+} from '../session-manifest.js';
+import { upsertApprovedActionTask } from '../tasks.js';
+import {
   authorizationMatches,
   completeDiscordPolicy,
   confineWebIngestInput,
@@ -112,7 +119,8 @@ test('HTTP review and note endpoints enforce conflicts and workspace containment
   const kbDir = await mkdtemp(path.join(tmpdir(), 'chronicle-web-http-'));
   process.env.KB_DIR = kbDir;
   process.env.INDEX_PATH = path.join(kbDir, '.index.db');
-  process.env.SESSIONS_DIR = path.join(kbDir, 'sessions');
+  const sessionsDir = path.join(kbDir, 'sessions');
+  process.env.SESSIONS_DIR = sessionsDir;
   const workspaceId = 'alpha';
   const otherWorkspace = 'beta';
   const meta = {
@@ -139,6 +147,45 @@ test('HTTP review and note endpoints enforce conflicts and workspace containment
   };
   const raw = await persistRawCapture({ rawText: 'Synthetic raw capture.', meta, workspaceId });
   const draft = await stageSourceDraft(summary, 'Synthetic raw capture.', meta, { workspaceId, rawCapture: raw });
+  const seededTask = await upsertApprovedActionTask({
+    workspaceId,
+    owner: 'Max',
+    task: 'Review the synthetic Chronicle draft.',
+    source: {
+      recordId: draft.id,
+      date: meta.date,
+      meetingPath: 'meetings/synthetic-review.md',
+      transcriptPath: raw.relativePath,
+    },
+  });
+  const session = {
+    ...createSessionManifest({
+      workspaceId,
+      guildId: 'guild-alpha',
+      channelId: 'channel-alpha',
+    }),
+    stage: 'transcribing' as const,
+    attempts: 1,
+    warnings: ['One speaker segment needs review.'],
+    meetingPath: path.join(workspaceRoot(workspaceId), 'meetings', 'session-record.md'),
+  };
+  const sessionDirectory = path.join(sessionsDir, session.id);
+  await ensureSessionDirectory(sessionDirectory);
+  await writeJsonAtomic(manifestPath(sessionDirectory), session);
+  const attentionSession = {
+    ...createSessionManifest({
+      workspaceId,
+      guildId: 'guild-alpha',
+      channelId: 'channel-alpha',
+      startedAt: new Date('2026-07-09T08:00:00.000Z'),
+    }),
+    stage: 'failed' as const,
+    recoverable: false,
+    error: 'Synthetic processing failure.',
+  };
+  const attentionSessionDirectory = path.join(sessionsDir, attentionSession.id);
+  await ensureSessionDirectory(attentionSessionDirectory);
+  await writeJsonAtomic(manifestPath(attentionSessionDirectory), attentionSession);
   await mkdir(path.join(workspaceRoot(otherWorkspace), 'meetings'), { recursive: true });
   const approvedFile = path.join(workspaceRoot(workspaceId), 'meetings', '2026-07-10-approved.md');
   await writeFile(
@@ -237,6 +284,83 @@ test('HTTP review and note endpoints enforce conflicts and workspace containment
     assert.equal(trustBody.index.exists, false);
     assert.equal(trustBody.index.fresh, false);
     assert.equal(trustBody.index.ready, false);
+
+    const taskList = await fetch(`${base}/api/tasks`, { headers });
+    assert.equal(taskList.status, 200);
+    const taskListBody = await taskList.json() as { tasks: Array<{ id: string; status: string }> };
+    assert.deepEqual(taskListBody.tasks.map((task) => task.id), [seededTask.task.id]);
+    const invalidOwnerFilter = await fetch(`${base}/api/tasks?owner=${'x'.repeat(201)}`, { headers });
+    assert.equal(invalidOwnerFilter.status, 400);
+
+    const digest = await fetch(`${base}/api/digest`, { headers });
+    assert.equal(digest.status, 200);
+    const digestBody = await digest.json() as { openTasks: Array<{ id: string }> };
+    assert.deepEqual(digestBody.openTasks.map((task) => task.id), [seededTask.task.id]);
+
+    const processing = await fetch(`${base}/api/processing?limit=1`, { headers });
+    assert.equal(processing.status, 200);
+    const processingBody = await processing.json() as {
+      totalCount: number;
+      inProgressCount: number;
+      attentionCount: number;
+      sessions: Array<{ id: string; stage: string; warningCount: number; recordPath?: string }>;
+    };
+    assert.equal(processingBody.totalCount, 2);
+    assert.equal(processingBody.inProgressCount, 1);
+    assert.equal(processingBody.attentionCount, 1);
+    assert.equal(processingBody.sessions.length, 1);
+    assert.equal(processingBody.sessions[0].id, session.id);
+    assert.equal(processingBody.sessions[0].stage, 'transcribing');
+    assert.equal(processingBody.sessions[0].warningCount, 1);
+    assert.equal(processingBody.sessions[0].recordPath, 'meetings/session-record.md');
+
+    const invalidProcessingLimit = await fetch(`${base}/api/processing?limit=0`, { headers });
+    assert.equal(invalidProcessingLimit.status, 400);
+
+    const taskDetail = await fetch(`${base}/api/tasks/${seededTask.task.id}`, { headers });
+    assert.equal(taskDetail.status, 200);
+    assert.equal(taskDetail.headers.get('etag'), '"1"');
+
+    const unversionedTask = await fetch(`${base}/api/tasks/${seededTask.task.id}`, {
+      method: 'PATCH',
+      headers: { ...headers, 'Content-Type': 'application/json', Origin: base },
+      body: JSON.stringify({ status: 'done' }),
+    });
+    assert.equal(unversionedTask.status, 428);
+
+    const emptyTaskPatch = await fetch(`${base}/api/tasks/${seededTask.task.id}`, {
+      method: 'PATCH',
+      headers: { ...headers, 'Content-Type': 'application/json', 'If-Match': '1', Origin: base },
+      body: '{}',
+    });
+    assert.equal(emptyTaskPatch.status, 400);
+
+    const staleTask = await fetch(`${base}/api/tasks/${seededTask.task.id}`, {
+      method: 'PATCH',
+      headers: { ...headers, 'Content-Type': 'application/json', 'If-Match': '2', Origin: base },
+      body: JSON.stringify({ status: 'done' }),
+    });
+    assert.equal(staleTask.status, 409);
+
+    const completedTask = await fetch(`${base}/api/tasks/${seededTask.task.id}`, {
+      method: 'PATCH',
+      headers: { ...headers, 'Content-Type': 'application/json', 'If-Match': '1', Origin: base },
+      body: JSON.stringify({ status: 'done' }),
+    });
+    assert.equal(completedTask.status, 200);
+    assert.equal(completedTask.headers.get('etag'), '"2"');
+    const completedTaskBody = await completedTask.json() as { task: { status: string } };
+    assert.equal(completedTaskBody.task.status, 'done');
+
+    const openTasks = await fetch(`${base}/api/tasks?status=open`, { headers });
+    assert.deepEqual((await openTasks.json() as { tasks: unknown[] }).tasks, []);
+    const doneTasks = await fetch(`${base}/api/tasks?status=done`, { headers });
+    assert.equal((await doneTasks.json() as { tasks: unknown[] }).tasks.length, 1);
+
+    const crossWorkspaceTask = await fetch(`${base}/api/tasks/${seededTask.task.id}`, {
+      headers: { 'X-Chronicle-Workspace': otherWorkspace },
+    });
+    assert.equal(crossWorkspaceTask.status, 404);
 
     const revokedMissing = await fetch(
       `${base}/api/ingest/preview/00000000-0000-4000-8000-000000000001`,

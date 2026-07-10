@@ -540,24 +540,25 @@ async function reportPipelineResult(
 
   const { summary } = result;
   const embed = new EmbedBuilder()
-    .setTitle(`📚 ${summary.title}`)
-    .setDescription(summary.summary.slice(0, 4000))
-    .addFields(
-      summary.decisions.length
-        ? [{ name: 'Decisions', value: summary.decisions.map((decision) => `• ${decision}`).join('\n').slice(0, 1024) }]
-        : [],
-    )
-    .addFields(
-      summary.action_items.length
-        ? [{
-            name: 'Action items',
-            value: summary.action_items
-              .map((item) => `• **${item.owner}**: ${item.task}`)
-              .join('\n')
-              .slice(0, 1024),
-          }]
-        : [],
-    );
+    .setTitle(`📚 ${summary.title}`);
+  if (summary.summary.trim()) {
+    embed.setDescription(summary.summary.slice(0, 4000));
+  }
+  if (summary.decisions.length) {
+    embed.addFields({
+      name: 'Decisions',
+      value: summary.decisions.map((decision) => `• ${decision}`).join('\n').slice(0, 1024),
+    });
+  }
+  if (summary.action_items.length) {
+    embed.addFields({
+      name: 'Action items',
+      value: summary.action_items
+        .map((item) => `• **${item.owner}**: ${item.task}`)
+        .join('\n')
+        .slice(0, 1024),
+    });
+  }
 
   embed.setFooter({
     text: `Filed as ${path.relative(process.cwd(), result.written.meetingPath)} · ${

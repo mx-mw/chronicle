@@ -14,6 +14,7 @@ export interface JsonRequest {
   user: string;
   schema: Record<string, unknown>;
   maxTokens?: number;
+  normalizeJson?: (value: unknown) => unknown;
 }
 
 export function extractJson(text: string): unknown {
@@ -80,36 +81,59 @@ function localTimeout(): number {
 
 async function completeJsonLocal(request: JsonRequest): Promise<unknown> {
   assertModelEndpointAllowed(config.llmBaseUrl, 'LLM_BASE_URL');
-  const response = await fetchWithTimeout(
-    `${config.llmBaseUrl.replace(/\/+$/, '')}/chat/completions`,
-    {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        ...(config.llmApiKey ? { Authorization: `Bearer ${config.llmApiKey}` } : {}),
+  let invalidOutput: unknown;
+  let repairInstruction: string | undefined;
+  for (let attempt = 1; attempt <= 2; attempt += 1) {
+    const response = await fetchWithTimeout(
+      `${config.llmBaseUrl.replace(/\/+$/, '')}/chat/completions`,
+      {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          ...(config.llmApiKey ? { Authorization: `Bearer ${config.llmApiKey}` } : {}),
+        },
+        body: JSON.stringify({
+          model: config.llmModel,
+          max_tokens: request.maxTokens ?? 8_000,
+          temperature: 0,
+          ...(booleanEnv('LLM_JSON_MODE', true) ? { response_format: { type: 'json_object' } } : {}),
+          messages: [
+            { role: 'system', content: request.system },
+            { role: 'user', content: request.user },
+            ...(repairInstruction
+              ? [{ role: 'user', content: repairInstruction }]
+              : []),
+          ],
+        }),
       },
-      body: JSON.stringify({
-        model: config.llmModel,
-        max_tokens: request.maxTokens ?? 8_000,
-        ...(booleanEnv('LLM_JSON_MODE', true) ? { response_format: { type: 'json_object' } } : {}),
-        messages: [
-          { role: 'system', content: request.system },
-          { role: 'user', content: request.user },
-        ],
-      }),
-    },
-    localTimeout(),
-  );
-  if (!response.ok) {
-    throw new Error(
-      `Local LLM request failed (${response.status} ${response.statusText}): ${await response.text()}. ` +
-        `Confirm that ${config.llmModel} is available.`,
+      localTimeout(),
     );
+    if (!response.ok) {
+      throw new Error(
+        `Local LLM request failed (${response.status} ${response.statusText}): ${await response.text()}. ` +
+          `Confirm that ${config.llmModel} is available.`,
+      );
+    }
+    const data = (await response.json()) as { choices?: { message?: { content?: string } }[] };
+    try {
+      const parsed = extractJson(data.choices?.[0]?.message?.content ?? '');
+      const normalized = request.normalizeJson ? request.normalizeJson(parsed) : parsed;
+      validateJsonSchema(normalized, request.schema);
+      return normalized;
+    } catch (error) {
+      invalidOutput = error;
+      repairInstruction =
+        `Your previous JSON response failed validation: ${
+          error instanceof Error ? error.message : String(error)
+        }. Return one corrected JSON object matching the requested schema. ` +
+        'Omit optional fields you cannot represent correctly; do not add commentary or Markdown.';
+    }
   }
-  const data = (await response.json()) as { choices?: { message?: { content?: string } }[] };
-  const parsed = extractJson(data.choices?.[0]?.message?.content ?? '');
-  validateJsonSchema(parsed, request.schema);
-  return parsed;
+  throw new Error(
+    `Local model returned invalid structured output twice: ${
+      invalidOutput instanceof Error ? invalidOutput.message : String(invalidOutput)
+    }`,
+  );
 }
 
 async function completeJsonAnthropic(request: JsonRequest): Promise<unknown> {
@@ -135,8 +159,9 @@ async function completeJsonAnthropic(request: JsonRequest): Promise<unknown> {
     .map((block) => block.text)
     .join('');
   const parsed = JSON.parse(text);
-  validateJsonSchema(parsed, request.schema);
-  return parsed;
+  const normalized = request.normalizeJson ? request.normalizeJson(parsed) : parsed;
+  validateJsonSchema(normalized, request.schema);
+  return normalized;
 }
 
 export async function completeJson(request: JsonRequest): Promise<unknown> {

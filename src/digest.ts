@@ -5,6 +5,7 @@ import { atomicWriteFile } from './fs-safe.js';
 import { listDrafts } from './kb.js';
 import { runMaintenance } from './maintenance.js';
 import { ageInDays, listApprovedDocuments, localDate, sectionItems } from './reporting.js';
+import { listTasks, type ChronicleTask } from './tasks.js';
 
 export interface ChronicleDigest {
   generatedAt: string;
@@ -13,6 +14,7 @@ export interface ChronicleDigest {
   records: { file: string; title: string; date?: string }[];
   decisions: { text: string; file: string }[];
   actionItems: { text: string; file: string }[];
+  openTasks: ChronicleTask[];
   openQuestions: { text: string; file: string }[];
   draftsAwaitingReview: number;
   maintenanceSuggestions: number;
@@ -38,9 +40,10 @@ export async function generateDigest(options: {
       sectionItems(document.body, heading).map((text) => ({ text, file: document.file })),
     );
 
-  const [drafts, maintenance] = await Promise.all([
+  const [drafts, maintenance, openTasks] = await Promise.all([
     listDrafts({ workspaceId, status: 'needs_review' }),
     runMaintenance({ workspaceId, now }),
+    listTasks({ workspaceId, status: 'open' }),
   ]);
 
   return {
@@ -50,6 +53,7 @@ export async function generateDigest(options: {
     records: records.map((record) => ({ file: record.file, title: record.title, date: record.date })),
     decisions: collect('Decisions'),
     actionItems: collect('Action items'),
+    openTasks,
     openQuestions: collect('Open questions'),
     draftsAwaitingReview: drafts.length,
     maintenanceSuggestions: maintenance.issues.length,
@@ -70,6 +74,11 @@ export function digestMarkdown(digest: ChronicleDigest): string {
         )
         .join('\n')
     : 'No approved records in this period.';
+  const tasks = digest.openTasks.length
+    ? digest.openTasks
+        .map((task) => `- [ ] **${task.owner}**: ${task.task} ${task.sources.at(-1)?.citation ?? ''}`.trimEnd())
+        .join('\n')
+    : 'No open tasks.';
 
   return (
     `# Weekly Chronicle\n\n` +
@@ -80,6 +89,7 @@ export function digestMarkdown(digest: ChronicleDigest): string {
     `- Drafts awaiting review: ${digest.draftsAwaitingReview}\n` +
     `- Maintenance suggestions: ${digest.maintenanceSuggestions}\n\n` +
     `## Recent records\n\n${records}\n\n` +
+    `## Open tasks\n\n${tasks}\n\n` +
     `## Decisions\n\n${linkedItems(digest.decisions, 'No new decisions.')}\n` +
     `## Action items\n\n${linkedItems(digest.actionItems, 'No new action items.')}\n` +
     `## Open questions\n\n${linkedItems(digest.openQuestions, 'No new open questions.')}`
