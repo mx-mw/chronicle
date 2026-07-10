@@ -8,6 +8,7 @@ import { promisify } from 'node:util';
 import { config, environmentFileSecurity } from './config.js';
 import { ensurePrivateDirectory } from './fs-safe.js';
 import { assertModelEndpointAllowed, isLoopbackUrl } from './runtime.js';
+import { EncryptedSourceCatalog } from './source-catalog.js';
 import { getIndexHealth } from './store.js';
 
 const run = promisify(execFile);
@@ -269,6 +270,91 @@ function policyChecks(discordConfigured = Boolean(process.env.DISCORD_TOKEN)): D
   return checks;
 }
 
+async function discordInboxChecks(): Promise<DoctorCheck[]> {
+  if (!config.discordInboxEnabled) {
+    return [check('discord-inbox', 'Discord Inbox', 'pass', 'Disabled by default')];
+  }
+
+  const checks: DoctorCheck[] = [];
+  if (!config.discordMessageContentEnabled) {
+    checks.push(check(
+      'discord-inbox-intent',
+      'Discord Inbox intent',
+      'fail',
+      'Inbox mode is enabled without confirming the privileged Message Content intent',
+      'Enable Message Content in Discord Developer Portal, then set DISCORD_MESSAGE_CONTENT_ENABLED=true.',
+    ));
+  } else {
+    checks.push(check(
+      'discord-inbox-intent',
+      'Discord Inbox intent',
+      'pass',
+      'Message Content intent is explicitly acknowledged',
+    ));
+  }
+
+  try {
+    const policy = config.inboxPolicy;
+    const complete = Boolean(
+      policy.guildIds.length &&
+      policy.channelIds.length &&
+      (policy.userIds.length || policy.roleIds.length),
+    );
+    if (!complete) {
+      checks.push(check(
+        'discord-inbox-policy',
+        'Discord Inbox authorization',
+        'fail',
+        'Inbox mode needs exact guild, channel, and user or role rules',
+        'Set INBOX_GUILD_IDS, INBOX_CHANNEL_IDS, and INBOX_USER_IDS or INBOX_ROLE_IDS.',
+      ));
+    } else {
+      checks.push(check(
+        'discord-inbox-policy',
+        'Discord Inbox authorization',
+        'pass',
+        `${policy.guildIds.length} guild, ${policy.channelIds.length} channel, and ${policy.userIds.length + policy.roleIds.length} identity rule(s)`,
+      ));
+    }
+
+    const privacy = config.discordPrivacyPolicyUrl;
+    const requests = config.discordDataRequestUrl;
+    config.inboxRetentionDays;
+    config.inboxMaxAttachments;
+    config.inboxMaxAttachmentBytes;
+    config.inboxMaxTotalAttachmentBytes;
+    config.inboxMaxUrls;
+    const catalog = new EncryptedSourceCatalog({
+      directory: config.sourceCatalogDir,
+      encryptionKey: config.sourceEncryptionKey,
+    });
+    await catalog.list({ limit: 1 });
+    checks.push(check(
+      'discord-inbox-storage',
+      'Discord Inbox encrypted storage',
+      'pass',
+      `Catalog is readable; privacy and data-request pages use ${new URL(privacy).host} and ${new URL(requests).host}`,
+    ));
+  } catch (error) {
+    checks.push(check(
+      'discord-inbox-storage',
+      'Discord Inbox encrypted storage',
+      'fail',
+      error instanceof Error ? error.message : String(error),
+      'Complete the INBOX_*, SOURCE_ENCRYPTION_KEY, DISCORD_PRIVACY_POLICY_URL, and DISCORD_DATA_REQUEST_URL settings.',
+    ));
+  }
+
+  checks.push(check(
+    'discord-inbox-permissions',
+    'Discord Inbox channel permissions',
+    'warn',
+    'Confirm the bot can View Channel, Send Messages, and Read Message History in every inbox channel',
+    'Verify the permissions with a live test message before relying on the inbox.',
+  ));
+  return checks;
+}
+
 async function storageCheck(): Promise<DoctorCheck> {
   const probe = path.join(config.kbDir, `.doctor-${randomUUID()}`);
   try {
@@ -409,6 +495,7 @@ export async function runDoctor(options: { offline?: boolean } = {}): Promise<Do
             ),
   );
   checks.push(...policyChecks());
+  checks.push(...await discordInboxChecks());
 
   checks.push(
     process.env.DISCORD_TOKEN

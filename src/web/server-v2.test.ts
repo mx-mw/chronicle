@@ -23,6 +23,7 @@ import {
   isTrustedHostHeader,
   mutationRequestAllowed,
   normaliseRecallResult,
+  sourceWorkspaceForBinding,
   validateWebBinding,
 } from './server.js';
 
@@ -68,6 +69,14 @@ test('remote authentication accepts Bearer and Basic password forms', () => {
     true,
   );
   assert.equal(authorizationMatches(undefined, token), false);
+});
+
+test('encrypted source workspace switching is local-only', () => {
+  assert.equal(sourceWorkspaceForBinding('guild-b', '127.0.0.1', 'guild-a'), 'guild-b');
+  assert.equal(sourceWorkspaceForBinding('guild-b', 'localhost', 'guild-a'), 'guild-b');
+  assert.equal(sourceWorkspaceForBinding('guild-b', '0.0.0.0', 'guild-a'), 'guild-a');
+  assert.equal(sourceWorkspaceForBinding('guild-b', 'chronicle.example', 'guild-a'), 'guild-a');
+  assert.equal(sourceWorkspaceForBinding(undefined, '127.0.0.1', 'guild-a'), 'guild-a');
 });
 
 test('mutation origin checks reject browser cross-site requests and permit API clients', () => {

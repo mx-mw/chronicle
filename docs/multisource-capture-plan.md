@@ -207,6 +207,12 @@ policy-blocked.
 
 ### Phase-one explicit capture
 
+Implementation note (2026-07-10): Chronicle now supports one equivalent
+explicit-submission path: every new message intentionally posted in an exact
+allowlisted Chronicle Inbox channel is captured. It does not read history,
+follow threads, cache other channel messages, or enable general-purpose watched
+channels. The sharing phases below remain blocked pending the Max discussion.
+
 1. Save to Chronicle message command
    - Right-click or long-press a message.
    - Select Apps, then Save to Chronicle.
@@ -241,7 +247,7 @@ The bot responds immediately with:
 
 Update one receipt as processing advances instead of posting repeated messages.
 
-### Selected channel and history ingestion
+### General-purpose watched channels and history ingestion
 
 POLICY BLOCKED pending a documented Discord policy or App Review determination
 that Chronicle's exact backfill and watched-channel behavior is necessary for
@@ -663,8 +669,10 @@ BLOCKED pending Phase 6.
 ## First-release non-goals
 
 - No silent or unlimited Discord server scrape.
-- No Discord history backfill or watched channel until its exact behavior is
-  confirmed as permitted for Chronicle's stated functionality.
+- No Discord history backfill or general-purpose watched channel until its
+  exact behavior is confirmed as permitted for Chronicle's stated
+  functionality. A dedicated, noticed submission inbox is the only live text
+  capture surface in the current release.
 - No ingestion from unallowlisted channels or private threads.
 - No Instagram login or DRM bypass.
 - No guarantee that arbitrary public Reels can be transcribed.
@@ -727,7 +735,7 @@ Do not begin with full Discord history or Instagram extraction.
 
 Build one trustworthy vertical slice:
 
-1. Save to Chronicle on one Discord message or DM.
+1. Save to Chronicle through one dedicated, allowlisted Discord Inbox.
 2. Persist Source and Save immediately as Local only.
 3. Process text, an attachment, or a submitted URL asynchronously.
 4. Show honest live state in the Library.

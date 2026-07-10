@@ -106,7 +106,8 @@ model download, run Parakeet once with `HF_HUB_DISABLE_XET=1`.
 1. Create a Discord application at
    <https://discord.com/developers/applications>. Invite it with the `bot` and
    `applications.commands` scopes and the View Channels, Send Messages, and
-   Connect permissions. No privileged gateway intent is required.
+   Connect permissions. Voice recording and commands need no privileged intent.
+   The optional Chronicle Inbox described below requires Message Content.
 
 2. Create the local configuration:
 
@@ -136,6 +137,29 @@ model download, run Parakeet once with `HF_HUB_DISABLE_XET=1`.
 
    `GUILD_ID` only controls where slash commands are registered quickly. It does
    not grant authorization.
+
+   To turn one dedicated text channel into a future-only Chronicle Inbox, enable
+   Message Content under Privileged Gateway Intents in Discord's Developer
+   Portal and add:
+
+   ```dotenv
+   DISCORD_INBOX_ENABLED=true
+   DISCORD_MESSAGE_CONTENT_ENABLED=true
+   INBOX_GUILD_IDS=123
+   INBOX_CHANNEL_IDS=456
+   INBOX_USER_IDS=789
+   SOURCE_ENCRYPTION_KEY=<output of: openssl rand -base64 32>
+   INBOX_RETENTION_DAYS=30
+   DISCORD_PRIVACY_POLICY_URL=https://your-domain.com/privacy
+   DISCORD_DATA_REQUEST_URL=https://your-domain.com/data-requests
+   ```
+
+   Guild and channel wildcards are rejected. Keep the key outside Git and back
+   it up securely; losing it makes the encrypted Library unreadable. The two
+   public URLs must explain collection/processing and provide access/export,
+   correction, and deletion requests. Start from the
+   [Discord Inbox privacy template](docs/discord-inbox-privacy-template.md);
+   it is not a policy until its placeholders are completed and it is published.
 
 4. Start Ollama in its own terminal (or as a system service):
 
@@ -181,6 +205,30 @@ model download, run Parakeet once with `HF_HUB_DISABLE_XET=1`.
 `AUTO_RECORD=false` is the default. Leave it off while validating a server and
 use `/record start` manually. When auto-recording is enabled, the same complete
 record allowlist still applies.
+
+## Chronicle Inbox
+
+Inbox mode processes only new messages intentionally posted in explicitly
+allowlisted channels. It never fetches channel history, scans the rest of a
+server, or implicitly follows threads. Bot, webhook, system, disallowed-channel,
+and disallowed-identity messages are ignored without a response.
+
+The message envelope commits to AES-256-GCM encrypted local storage before the
+bot posts a receipt or starts model work. Plain text and ordinary web links are
+processed asynchronously. YouTube, Instagram Reels, and other provider-media
+links remain honest link-only Library items with the sender's note so Inbox
+processing does not leave plaintext media artifacts. Attachments are currently
+retained as encrypted metadata and marked partial; byte download, OCR, and media
+transcription are not enabled by this release.
+
+Edits create a new source revision and cancel stale work. Deletions observed
+while the bot is online erase content and leave only an encrypted, content-free
+tombstone. Deletions missed while the bot is offline cannot be reconstructed
+without history access, so Chronicle does not claim perfect synchronization.
+Expired sources are tombstoned on startup, during hourly sweeps, and before
+Library reads according to `INBOX_RETENTION_DAYS`. Source analysis remains
+inside the encrypted Library and does not enter plaintext Review or Recall
+storage.
 
 ## Recording and review
 
@@ -330,6 +378,7 @@ kb/
     ledger.db                   operational audit ledger
     write.lock                  cross-process knowledge lock
     approval-transactions/      crash-recovery journals for approval
+  .sources/                     encrypted Discord Inbox sources and tombstones
   .index.db                     rebuildable search index
 ```
 
@@ -347,6 +396,11 @@ installation may contact its model registry. Set
 `ALLOW_REMOTE_MODEL_ENDPOINTS=true` only when the endpoint and transport are
 trusted.
 
+Discord Inbox message content, link notes, analysis, and attachment metadata
+stay encrypted at rest under `SOURCE_CATALOG_DIR`. Signed Discord attachment
+query strings are never persisted. Plaintext Discord-derived content is not
+written to the Markdown knowledge base or search index in this release.
+
 Browser and CLI article capture accept only HTTP(S) targets without embedded
 credentials. Every redirect is revalidated, any private or special-purpose DNS
 answer rejects the request, and the connection is pinned to the address that
@@ -360,13 +414,20 @@ key and should be treated as an off-machine data-processing choice.
 For remote web access, set a strong `WEB_AUTH_TOKEN`, restrict
 `WEB_ALLOWED_HOSTS`, and put Chronicle behind trusted encrypted transport. The
 server accepts Bearer auth and HTTP Basic password auth. Loopback access needs
-no token.
+no token. Remote encrypted-source routes are fixed to `WEB_WORKSPACE_ID` and
+ignore `X-Chronicle-Workspace`; this is full operator access to that one
+workspace, not a multi-user permission system. Source retention is checked on
+every encrypted-source Library API read and by an hourly web-server sweep.
 
 ## Important configuration
 
 | Variable | Default | Purpose |
 | --- | --- | --- |
 | `AUTO_RECORD` | `false` | Enable consent-gated voice-state auto capture |
+| `DISCORD_INBOX_ENABLED` | `false` | Process new messages in exact allowlisted Inbox channels |
+| `INBOX_*_IDS` | empty | Exact guild/channel and identity Inbox allowlists |
+| `SOURCE_ENCRYPTION_KEY` | empty | Required base64 32-byte key for encrypted Inbox storage |
+| `INBOX_RETENTION_DAYS` | empty | Required content retention window when Inbox mode is enabled |
 | `RECORD_*_IDS` | empty | Guild, channel, and identity record allowlists |
 | `RECALL_*_IDS` | empty | Independent recall allowlists |
 | `REQUIRE_REVIEW` | `true` | Keep model output out of approved memory until review |
@@ -377,7 +438,7 @@ no token.
 | `MAX_SESSION_SEGMENTS` | `5000` | PCM file/inode and manifest-growth ceiling |
 | `RAW_AUDIO_RETENTION_HOURS` | `72` | Raw session-artifact retention; `0` purges after processing |
 | `WORKSPACE_ID` | `default` | CLI/default knowledge workspace |
-| `WEB_WORKSPACE_ID` | `default` | Browser workspace; set to the Discord guild ID to review its drafts |
+| `WEB_WORKSPACE_ID` | `default` | Browser workspace and mandatory remote encrypted-source workspace; set to the Discord guild ID |
 | `LLM_PROVIDER` | `local` | `local` or explicit `anthropic` processing |
 | `EMBED_MODEL` | `nomic-embed-text` | Local search embedding model |
 | `PROCESSING_RETRIES` | `2` | Retries after the initial queue attempt |

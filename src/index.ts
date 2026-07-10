@@ -2,9 +2,15 @@ import {
   ChatInputCommandInteraction,
   Client,
   EmbedBuilder,
+  Events,
   GatewayIntentBits,
+  MessageType,
+  Options,
+  Partials,
   SlashCommandBuilder,
   type GuildMember,
+  type Message,
+  type PartialMessage,
   type SendableChannels,
   type VoiceBasedChannel,
 } from 'discord.js';
@@ -12,6 +18,11 @@ import { randomUUID } from 'node:crypto';
 import { access } from 'node:fs/promises';
 import path from 'node:path';
 import { config } from './config.js';
+import {
+  createDiscordInboxService,
+  type DiscordInboxMessage,
+} from './discord-inbox.js';
+import { extractInboxUrls, processInboxSource } from './inbox-processing.js';
 import { ProcessingCancelledError, ProcessingQueue } from './jobs.js';
 import { readDraft, rejectDraft, tombstoneOperation } from './kb.js';
 import { describeProvider } from './llm.js';
@@ -41,6 +52,9 @@ import {
   type SessionManifest,
   type SessionStage,
 } from './session-manifest.js';
+import { extract } from './sources/index.js';
+import { EncryptedSourceCatalog, type SourceCatalogRecord } from './source-catalog.js';
+import { summarizeSource } from './summarize.js';
 import { assertParakeetReady } from './transcribe.js';
 import {
   admitParticipantAfterNotice,
@@ -97,7 +111,7 @@ const ACTIONABLE_SESSION_STAGES = new Set<SessionStage>([
   'empty',
 ]);
 const backgroundTasks = new Set<Promise<unknown>>();
-const processingQueue = new ProcessingQueue<PipelineResult | null>({
+const processingQueue = new ProcessingQueue<unknown>({
   maxPending: config.processingQueueLimit,
   retries: config.processingRetries,
   timeoutMs: config.processingTimeoutMs,
@@ -105,6 +119,9 @@ const processingQueue = new ProcessingQueue<PipelineResult | null>({
 
 let shuttingDown = false;
 let runtimeReady = false;
+let discordInboxReady = false;
+let discordInboxRetentionTimer: NodeJS.Timeout | undefined;
+const DISCORD_INBOX_RETENTION_SWEEP_MS = 60 * 60_000;
 
 /** Count non-bot members in a voice channel. The bot must never count itself. */
 function humanCount(channel: VoiceBasedChannel): number {
@@ -629,7 +646,7 @@ async function enqueueCapture(
             date: manifest.startedAt.slice(0, 10),
           },
         ),
-    });
+    }) as PipelineResult | null;
     await reportPipelineResult(result, channel, capture.sessionId);
   } catch (error) {
     if (error instanceof ProcessingCancelledError) return;
@@ -826,11 +843,165 @@ const commands = [
     ),
 ].map((command) => command.toJSON());
 
+const clientIntents = [GatewayIntentBits.Guilds, GatewayIntentBits.GuildVoiceStates];
+if (config.discordInboxEnabled) {
+  clientIntents.push(GatewayIntentBits.GuildMessages, GatewayIntentBits.MessageContent);
+}
+
 const client = new Client({
-  intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildVoiceStates],
+  intents: clientIntents,
+  partials: config.discordInboxEnabled ? [Partials.Channel, Partials.Message] : [],
+  // Gateway delivery cannot be channel-scoped. Do not retain messages from
+  // visible, unallowlisted channels in discord.js's default per-channel cache.
+  makeCache: Options.cacheWithLimits({
+    ...Options.DefaultMakeCacheSettings,
+    MessageManager: 0,
+  }),
 });
 
+function requireCompleteInboxPolicy(): void {
+  const policy = config.inboxPolicy;
+  if (!config.discordMessageContentEnabled) {
+    throw new Error(
+      'Discord Inbox requires DISCORD_MESSAGE_CONTENT_ENABLED=true after enabling the intent in Discord Developer Portal.',
+    );
+  }
+  if (
+    policy.guildIds.length === 0 ||
+    policy.channelIds.length === 0 ||
+    (policy.userIds.length === 0 && policy.roleIds.length === 0)
+  ) {
+    throw new Error(
+      'Discord Inbox requires exact INBOX_GUILD_IDS and INBOX_CHANNEL_IDS plus an INBOX_USER_IDS or INBOX_ROLE_IDS identity rule.',
+    );
+  }
+}
+
+function discordInboxMessage(message: Message): DiscordInboxMessage | undefined {
+  if (!message.inGuild()) return undefined;
+  const member = message.member;
+  const attachments = [...message.attachments.values()].map((attachment) => ({
+    id: attachment.id,
+    filename: attachment.name,
+    url: attachment.url,
+    contentType: attachment.contentType ?? undefined,
+    sizeBytes: attachment.size,
+    width: attachment.width ?? undefined,
+    height: attachment.height ?? undefined,
+  }));
+  return {
+    id: message.id,
+    guildId: message.guildId,
+    channelId: message.channelId,
+    author: {
+      id: message.author.id,
+      username: message.author.username,
+      displayName: member?.displayName ?? message.author.globalName ?? undefined,
+      bot: message.author.bot,
+    },
+    roleIds: member ? [...member.roles.cache.keys()] : undefined,
+    content: message.content,
+    createdAt: message.createdAt.toISOString(),
+    editedAt: message.editedAt?.toISOString(),
+    type: message.type === MessageType.Default
+      ? 'default'
+      : message.type === MessageType.Reply
+        ? 'reply'
+        : 'other',
+    webhookId: message.webhookId ?? undefined,
+    system: message.system,
+    urls: extractInboxUrls(message.content, [], config.inboxMaxUrls),
+    attachments,
+    sendReceipt: async (content) => {
+      const receipt = await message.reply({
+        content,
+        allowedMentions: { parse: [], repliedUser: false },
+      });
+      return {
+        update: async (next) => {
+          await receipt.edit({ content: next, allowedMentions: { parse: [] } });
+        },
+      };
+    },
+  };
+}
+
+async function processDiscordInboxRecord(
+  record: SourceCatalogRecord,
+  signal: AbortSignal,
+) {
+  if (signal.aborted) throw signal.reason;
+  const analysis = await processInboxSource(
+    {
+      content: record.source.text,
+      capturedAt: record.save.capturedAt,
+      authorName: record.source.author.displayName ?? record.source.author.username,
+      origin:
+        `https://discord.com/channels/${record.source.discord.guildId}/` +
+        `${record.source.discord.channelId}/${record.source.discord.messageId}`,
+      urls: record.source.urls.map(({ url }) => url),
+      attachments: record.source.attachments.map((attachment) => ({
+        id: attachment.id,
+        filename: attachment.filename,
+        contentType: attachment.contentType,
+        size: attachment.sizeBytes ?? 0,
+      })),
+    },
+    { extract, summarize: summarizeSource },
+  );
+  if (signal.aborted) throw signal.reason;
+  return analysis;
+}
+
+let discordInboxService: ReturnType<typeof createDiscordInboxService> | undefined;
+if (config.discordInboxEnabled) {
+  requireCompleteInboxPolicy();
+  const privacyPolicyUrl = config.discordPrivacyPolicyUrl;
+  const dataRequestUrl = config.discordDataRequestUrl;
+  const retentionDays = config.inboxRetentionDays;
+  const catalog = new EncryptedSourceCatalog({
+    directory: config.sourceCatalogDir,
+    encryptionKey: config.sourceEncryptionKey,
+  });
+  const purged = await catalog.purgeExpired(retentionDays);
+  if (purged > 0) console.log(`Discarded ${purged} expired Discord Inbox source(s).`);
+  discordInboxService = createDiscordInboxService({
+    catalog,
+    queue: processingQueue,
+    policy: config.inboxPolicy,
+    process: processDiscordInboxRecord,
+    resolveCurrentRoleIds: async (guildId, userId) => {
+      const guild =
+        client.guilds.cache.get(guildId) ??
+        await client.guilds.fetch(guildId).catch(() => undefined);
+      if (!guild) return undefined;
+      const member =
+        guild.members.cache.get(userId) ??
+        await guild.members.fetch(userId).catch(() => undefined);
+      return member ? roleIds(member) : undefined;
+    },
+    disclosure:
+      `${modelProcessingNotice()} Privacy: ${privacyPolicyUrl} Data requests: ${dataRequestUrl}`,
+    maxAttachments: config.inboxMaxAttachments,
+    maxAttachmentBytes: config.inboxMaxAttachmentBytes,
+    maxTotalAttachmentBytes: config.inboxMaxTotalAttachmentBytes,
+    maxUrls: config.inboxMaxUrls,
+  });
+  discordInboxRetentionTimer = setInterval(() => {
+    trackDiscordInboxTask(
+      catalog.purgeExpired(retentionDays).then((count) => {
+        if (count > 0) console.log(`Discarded ${count} expired Discord Inbox source(s).`);
+      }),
+      'retention sweep',
+    );
+  }, DISCORD_INBOX_RETENTION_SWEEP_MS);
+  discordInboxRetentionTimer.unref();
+}
+
 client.once('clientReady', async () => {
+  // Inbox storage is ready before login. Admit new messages immediately rather
+  // than dropping them while voice recovery and command registration await.
+  discordInboxReady = Boolean(discordInboxService);
   try {
     // Safety recovery precedes command readiness. A failed discard
     // reconciliation must never leave approvals/recording commands live.
@@ -842,18 +1013,123 @@ client.once('clientReady', async () => {
       await client.application!.commands.set(commands);
     }
     runtimeReady = true;
+    if (discordInboxService) {
+      trackBackground(
+        discordInboxService.recover().then((count) => {
+          if (count > 0) console.log(`Recovered ${count} queued Discord Inbox source(s).`);
+        }),
+      );
+    }
     console.log(`Chronicle is ready as ${client.user!.tag}`);
     console.log(`Distilling and answering with ${describeProvider()}`);
     console.log(`Auto-record is ${config.autoRecord ? 'enabled' : 'disabled'}; review is ${
       config.requireReview ? 'required' : 'auto-approved'
     }.`);
+    console.log(`Discord Inbox is ${discordInboxService ? 'enabled for allowlisted new messages' : 'disabled'}.`);
   } catch (error) {
     console.error('Chronicle startup recovery failed:', error);
     shuttingDown = true;
+    discordInboxReady = false;
+    await discordInboxService?.close();
+    if (discordInboxRetentionTimer) clearInterval(discordInboxRetentionTimer);
+    discordInboxRetentionTimer = undefined;
     processingQueue.close();
     processingQueue.cancelAll('Chronicle safety recovery failed during startup.');
     client.destroy();
     process.exitCode = 1;
+  }
+});
+
+function inboxLocationAllowed(guildId: string | null, channelId: string): boolean {
+  if (!discordInboxService || !guildId) return false;
+  const policy = config.inboxPolicy;
+  return policy.guildIds.includes(guildId) && policy.channelIds.includes(channelId);
+}
+
+function inboxMessageMetadataAllowed(message: Message): boolean {
+  if (!message.inGuild() || !inboxLocationAllowed(message.guildId, message.channelId)) return false;
+  if (
+    message.author.bot ||
+    message.webhookId ||
+    message.system ||
+    (message.type !== MessageType.Default && message.type !== MessageType.Reply) ||
+    !message.member
+  ) {
+    return false;
+  }
+  return authorize(config.inboxPolicy, {
+    guildId: message.guildId,
+    channelId: message.channelId,
+    userId: message.author.id,
+    roleIds: [...message.member.roles.cache.keys()],
+  }).allowed;
+}
+
+function trackDiscordInboxTask(task: Promise<unknown>, action: string): void {
+  trackBackground(task.catch(() => {
+    console.error(`Discord Inbox ${action} failed; inspect the encrypted Library state.`);
+  }));
+}
+
+client.on(Events.MessageCreate, (message) => {
+  if (!discordInboxReady || shuttingDown || !inboxMessageMetadataAllowed(message)) return;
+  const input = discordInboxMessage(message);
+  if (input) trackDiscordInboxTask(discordInboxService!.handleCreate(input), 'capture');
+});
+
+client.on(Events.MessageUpdate, (_oldMessage, updatedMessage) => {
+  if (
+    !discordInboxReady ||
+    shuttingDown ||
+    !inboxLocationAllowed(updatedMessage.guildId, updatedMessage.channelId)
+  ) {
+    return;
+  }
+  trackDiscordInboxTask((async () => {
+    const identity = {
+      guildId: updatedMessage.guildId!,
+      channelId: updatedMessage.channelId,
+      messageId: updatedMessage.id,
+    };
+    if (updatedMessage.partial && !await discordInboxService!.canFetchUpdate(identity)) return;
+    const complete = updatedMessage.partial ? await updatedMessage.fetch() : updatedMessage;
+    if (!inboxMessageMetadataAllowed(complete)) return;
+    const input = discordInboxMessage(complete);
+    if (input) await discordInboxService!.handleUpdate(input);
+  })(), 'update');
+});
+
+client.on(Events.MessageDelete, (message: Message | PartialMessage) => {
+  if (
+    !discordInboxReady ||
+    shuttingDown ||
+    !message.guildId ||
+    !inboxLocationAllowed(message.guildId, message.channelId)
+  ) {
+    return;
+  }
+  trackDiscordInboxTask(
+    discordInboxService!.handleDelete({
+      guildId: message.guildId,
+      channelId: message.channelId,
+      messageId: message.id,
+    }),
+    'deletion',
+  );
+});
+
+client.on(Events.MessageBulkDelete, (messages) => {
+  if (!discordInboxReady || shuttingDown || !discordInboxService) return;
+  for (const message of messages.values()) {
+    if (!message.guildId || !inboxLocationAllowed(message.guildId, message.channelId)) continue;
+    trackDiscordInboxTask(
+      discordInboxService.handleDelete({
+        guildId: message.guildId,
+        channelId: message.channelId,
+        messageId: message.id,
+      }),
+      'bulk deletion',
+    );
   }
 });
 
@@ -1402,6 +1678,10 @@ async function gracefulShutdown(signal: NodeJS.Signals): Promise<void> {
     process.exit(1);
   }
   shuttingDown = true;
+  discordInboxReady = false;
+  await discordInboxService?.close();
+  if (discordInboxRetentionTimer) clearInterval(discordInboxRetentionTimer);
+  discordInboxRetentionTimer = undefined;
   console.log(`Received ${signal}; preserving active captures before shutdown…`);
   processingQueue.close();
   for (const pending of [...pendingStarts.values()]) {

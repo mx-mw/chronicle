@@ -1,7 +1,7 @@
 // Chronicle's local-first web surface. This module deliberately stays on
 // node:http so the archive has no frontend build dependency.
 
-import { randomUUID, timingSafeEqual } from 'node:crypto';
+import { createHash, randomUUID, timingSafeEqual } from 'node:crypto';
 import { constants, existsSync } from 'node:fs';
 import { access, readFile, realpath } from 'node:fs/promises';
 import { createServer, type IncomingMessage, type ServerResponse } from 'node:http';
@@ -25,6 +25,10 @@ import { recall } from '../recall.js';
 import { localDate } from '../reporting.js';
 import { extract, type ExtractedSource, type SourceKind } from '../sources/index.js';
 import { getIndexHealth, search } from '../store.js';
+import {
+  EncryptedSourceCatalog,
+  type SourceCatalogEntry,
+} from '../source-catalog.js';
 import { summarizeSource, type SourceSummary } from '../summarize.js';
 import {
   listTasks,
@@ -62,6 +66,7 @@ const PORT = integerSetting('WEB_PORT or PORT', process.env.WEB_PORT || process.
 const AUTH_TOKEN = process.env.WEB_AUTH_TOKEN || '';
 const DEFAULT_WORKSPACE = process.env.WEB_WORKSPACE_ID || 'default';
 const MAX_BODY = 256 * 1024;
+const SOURCE_RETENTION_SWEEP_MS = 60 * 60 * 1_000;
 const PREVIEW_TTL_MS = integerSetting(
   'WEB_PREVIEW_TTL_MS',
   process.env.WEB_PREVIEW_TTL_MS,
@@ -108,6 +113,8 @@ type ReviewApi = {
 };
 
 let reviewApiPromise: Promise<ReviewApi> | undefined;
+let sourceCatalog: EncryptedSourceCatalog | undefined;
+let sourceCatalogIdentity = '';
 
 type PreviewEntry = {
   workspaceId: string;
@@ -123,6 +130,73 @@ const previewExpiryTimers = new Map<string, NodeJS.Timeout>();
 async function getReviewApi(): Promise<ReviewApi> {
   reviewApiPromise ??= import('../kb.js').then((module) => module as unknown as ReviewApi);
   return reviewApiPromise;
+}
+
+function getSourceCatalog(): EncryptedSourceCatalog {
+  if (!process.env.SOURCE_ENCRYPTION_KEY?.trim()) {
+    throw new NoteAccessError(
+      'The encrypted source catalog is unavailable until SOURCE_ENCRYPTION_KEY is configured.',
+      503,
+    );
+  }
+  let directory: string;
+  let encryptionKey: string;
+  try {
+    directory = config.sourceCatalogDir;
+    encryptionKey = config.sourceEncryptionKey;
+  } catch (error) {
+    throw new NoteAccessError(
+      error instanceof Error ? error.message : 'The encrypted source catalog configuration is invalid.',
+      503,
+    );
+  }
+  const identity = `${directory}\0${createHash('sha256').update(encryptionKey).digest('hex')}`;
+  if (!sourceCatalog || sourceCatalogIdentity !== identity) {
+    try {
+      sourceCatalog = new EncryptedSourceCatalog({ directory, encryptionKey });
+      sourceCatalogIdentity = identity;
+    } catch (error) {
+      throw new NoteAccessError(
+        error instanceof Error ? error.message : 'The encrypted source catalog could not be opened.',
+        503,
+      );
+    }
+  }
+  return sourceCatalog;
+}
+
+function sourceRetentionDays(): number {
+  try {
+    return config.inboxRetentionDays;
+  } catch (error) {
+    throw new NoteAccessError(
+      error instanceof Error ? error.message : 'Inbox retention is not configured.',
+      503,
+    );
+  }
+}
+
+async function getRetainedSourceCatalog(): Promise<EncryptedSourceCatalog> {
+  const catalog = getSourceCatalog();
+  await catalog.purgeExpired(sourceRetentionDays());
+  return catalog;
+}
+
+function sourceWorkspace(entry: SourceCatalogEntry): string {
+  return entry.recordType === 'source' ? entry.source.workspaceId : entry.workspaceId;
+}
+
+function validSourceId(raw: string): string {
+  let id: string;
+  try {
+    id = decodeURIComponent(raw);
+  } catch {
+    throw new NoteAccessError('Invalid source identifier.', 400);
+  }
+  if (!/^source_[a-f0-9]{64}$/.test(id)) {
+    throw new NoteAccessError('Invalid source identifier.', 400);
+  }
+  return id;
 }
 
 async function withKnowledgeRead<T>(operation: () => Promise<T>): Promise<T> {
@@ -266,6 +340,32 @@ function workspaceFromRequest(req: IncomingMessage): string {
   } catch (error) {
     throw new NoteAccessError(error instanceof Error ? error.message : 'Invalid workspace', 400);
   }
+}
+
+/** Remote source access is one fixed operator workspace, never a caller-selected tenant. */
+export function sourceWorkspaceForBinding(
+  requestedWorkspace: string | undefined,
+  bindHost: string,
+  configuredWorkspace: string,
+): string {
+  const selected = isLoopbackHost(bindHost)
+    ? requestedWorkspace || configuredWorkspace
+    : configuredWorkspace;
+  return normalizeWorkspaceId(selected);
+}
+
+function sourceWorkspaceFromRequest(req: IncomingMessage): string {
+  const header = req.headers['x-chronicle-workspace'];
+  const requested = Array.isArray(header) ? header[0] : header;
+  try {
+    return sourceWorkspaceForBinding(requested, HOST, DEFAULT_WORKSPACE);
+  } catch (error) {
+    throw new NoteAccessError(error instanceof Error ? error.message : 'Invalid workspace', 400);
+  }
+}
+
+function isEncryptedSourceRoute(pathname: string): boolean {
+  return pathname === '/api/sources' || pathname.startsWith('/api/sources/');
 }
 
 function validReviewId(raw: string): string {
@@ -1069,7 +1169,9 @@ async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> 
   const url = new URL(req.url || '/', 'http://chronicle.local');
   const { pathname } = url;
   const method = req.method || 'GET';
-  const workspaceId = workspaceFromRequest(req);
+  const workspaceId = isEncryptedSourceRoute(pathname)
+    ? sourceWorkspaceFromRequest(req)
+    : workspaceFromRequest(req);
 
   if (method === 'GET' && !pathname.startsWith('/api/') && pathname !== '/healthz') {
     if (await servePublic(pathname, res)) return;
@@ -1116,6 +1218,53 @@ async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> 
   if (await handleTaskRoute(req, res, url, method, workspaceId)) return;
 
   if (await handleReviewRoute(req, res, pathname, method, workspaceId)) return;
+
+  if (method === 'GET' && pathname === '/api/sources') {
+    const rawLimit = url.searchParams.get('limit');
+    const limit = rawLimit === null ? 24 : Number(rawLimit);
+    if (!Number.isSafeInteger(limit) || limit < 1 || limit > 100) {
+      throw new NoteAccessError('Source limit must be an integer between 1 and 100.', 400);
+    }
+    const cursor = url.searchParams.get('cursor') || undefined;
+    if (!process.env.SOURCE_ENCRYPTION_KEY?.trim()) {
+      return sendJson(res, 200, {
+        sources: [],
+        nextCursor: null,
+        workspaceId,
+        available: false,
+      });
+    }
+    try {
+      const page = await (await getRetainedSourceCatalog()).list({ workspaceId, limit, cursor });
+      return sendJson(res, 200, {
+        sources: page.items,
+        nextCursor: page.nextCursor ?? null,
+        workspaceId,
+      });
+    } catch (error) {
+      if (/cursor/i.test(error instanceof Error ? error.message : String(error))) {
+        throw new NoteAccessError('Invalid or expired source cursor.', 400);
+      }
+      throw error;
+    }
+  }
+
+  const sourceMatch = pathname.match(/^\/api\/sources\/([^/]+)$/);
+  if (sourceMatch && (method === 'GET' || method === 'DELETE')) {
+    const id = validSourceId(sourceMatch[1]);
+    // A missing retention setting must fail closed for reads, but must never
+    // prevent an operator from erasing an existing source.
+    const catalog = method === 'GET' ? await getRetainedSourceCatalog() : getSourceCatalog();
+    const source = await catalog.get(id);
+    if (!source || sourceWorkspace(source) !== workspaceId) {
+      throw new NoteAccessError('Source not found.', 404);
+    }
+    if (method === 'DELETE') {
+      const discarded = await catalog.discard(id, 'user_requested');
+      return sendJson(res, 200, { source: discarded, workspaceId, discarded: true });
+    }
+    return sendJson(res, 200, { source, workspaceId });
+  }
 
   if (method === 'GET' && (pathname === '/api/library' || pathname === '/api/notes')) {
     const map = await withKnowledgeRead(() => buildPalaceMap(workspaceId));
@@ -1172,7 +1321,7 @@ async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> 
 
 export function createChronicleWebServer() {
   validateWebBinding();
-  return createServer((req, res) => {
+  const server = createServer((req, res) => {
     applySecurityHeaders(res);
     handle(req, res).catch((error) => {
       if (res.headersSent) return res.end();
@@ -1189,6 +1338,28 @@ export function createChronicleWebServer() {
       });
     });
   });
+  if (
+    process.env.SOURCE_ENCRYPTION_KEY?.trim() &&
+    process.env.INBOX_RETENTION_DAYS?.trim()
+  ) {
+    let sweeping = false;
+    const sweep = async () => {
+      if (sweeping) return;
+      sweeping = true;
+      try {
+        await getRetainedSourceCatalog();
+      } catch {
+        console.error('Encrypted source retention sweep failed.');
+      } finally {
+        sweeping = false;
+      }
+    };
+    const retentionTimer = setInterval(() => void sweep(), SOURCE_RETENTION_SWEEP_MS);
+    retentionTimer.unref();
+    server.once('close', () => clearInterval(retentionTimer));
+    void sweep();
+  }
+  return server;
 }
 
 export async function startChronicleWebServer() {
