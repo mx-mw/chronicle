@@ -1,0 +1,139 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta
+      name="description"
+      content="Review captured knowledge, read approved records, and recall decisions with evidence."
+    />
+    <meta name="color-scheme" content="light dark" />
+    <title>Chronicle | Working archive</title>
+    <link rel="stylesheet" href="/styles.css" />
+    <script src="/app.js" defer></script>
+  </head>
+  <body>
+    <a class="skip-link" href="#main-content">Skip to content</a>
+
+    <div class="app-shell" id="app">
+      <header class="masthead">
+        <div class="masthead-inner">
+          <button
+            class="menu-button mobile-only"
+            id="menu-button"
+            type="button"
+            aria-controls="navigation-drawer"
+            aria-expanded="false"
+          >
+            Menu
+          </button>
+
+          <a class="wordmark" href="#inbox" data-view-link="inbox" aria-label="Chronicle inbox">
+            <span class="wordmark-name">Chronicle</span>
+            <span class="wordmark-note">working archive</span>
+          </a>
+
+          <div class="masthead-actions">
+            <button class="health-button" id="health-button" type="button" data-view-link="trust">
+              <span class="health-state" id="health-state">Checking</span>
+              <span class="health-detail" id="health-detail">Archive health</span>
+            </button>
+            <button class="theme-button" id="theme-button" type="button" aria-label="Change color theme">
+              Theme: system
+            </button>
+          </div>
+        </div>
+      </header>
+
+      <section class="command-band" aria-labelledby="command-title">
+        <div class="command-inner">
+          <div class="command-heading">
+            <h2 id="command-title">Ask or find</h2>
+            <div class="mode-switch" role="group" aria-label="Command mode">
+              <button class="mode-button is-active" type="button" data-command-mode="ask" aria-pressed="true">
+                Ask
+              </button>
+              <button class="mode-button" type="button" data-command-mode="find" aria-pressed="false">
+                Find
+              </button>
+            </div>
+          </div>
+          <form id="command-form" class="command-form" autocomplete="off">
+            <div class="field command-field">
+              <label id="command-label" for="command-input">Ask the approved archive</label>
+              <div class="command-control">
+                <input
+                  id="command-input"
+                  name="query"
+                  type="search"
+                  inputmode="search"
+                  placeholder="What did we decide about storage?"
+                  aria-describedby="command-help command-error"
+                />
+                <button class="button button-primary" id="command-submit" type="submit">Ask</button>
+              </div>
+              <p class="field-help" id="command-help">Answers cite retrieved excerpts. Chronicle abstains when evidence is weak.</p>
+              <p class="field-error" id="command-error" hidden></p>
+            </div>
+          </form>
+          <section class="command-results" id="command-results" aria-label="Command results" hidden></section>
+        </div>
+      </section>
+
+      <div class="workspace">
+        <button class="drawer-backdrop" id="drawer-backdrop" type="button" aria-label="Dismiss navigation overlay" hidden></button>
+        <aside class="navigation-drawer" id="navigation-drawer" aria-label="Chronicle navigation" tabindex="-1">
+          <button class="drawer-close mobile-only" type="button" data-close-drawer>Close navigation</button>
+          <button class="drawer-theme mobile-only" id="drawer-theme-button" type="button">Theme: system</button>
+          <nav class="primary-navigation">
+            <button class="nav-item is-active" type="button" data-view-link="inbox" aria-current="page">
+              <span>Inbox</span>
+              <span class="nav-count" id="inbox-count" aria-label="Loading inbox count">...</span>
+            </button>
+            <button class="nav-item" type="button" data-view-link="capture"><span>Capture</span></button>
+            <button class="nav-item" type="button" data-view-link="records"><span>Records</span></button>
+            <button class="nav-item" type="button" data-view-link="topics"><span>Topics</span></button>
+            <button class="nav-item" type="button" data-command-link="ask"><span>Ask</span></button>
+            <button class="nav-item" type="button" data-command-link="find"><span>Find</span></button>
+            <button class="nav-item" type="button" data-view-link="digest"><span>Digest</span></button>
+            <button class="nav-item" type="button" data-view-link="trust"><span>Trust</span></button>
+          </nav>
+          <div class="drawer-note">
+            <strong>Memory boundary</strong>
+            <p>Only approved records enter recall.</p>
+          </div>
+        </aside>
+
+        <main class="main-content" id="main-content" tabindex="-1" aria-busy="true">
+          <section class="view-loading" aria-label="Loading Chronicle">
+            <div class="skeleton skeleton-title"></div>
+            <div class="skeleton skeleton-line"></div>
+            <div class="skeleton skeleton-panel"></div>
+          </section>
+        </main>
+      </div>
+    </div>
+
+    <dialog class="confirm-dialog" id="reject-dialog" aria-labelledby="reject-title">
+      <form method="dialog" id="reject-form">
+        <h2 id="reject-title">Reject this draft?</h2>
+        <p>The draft leaves the review queue and will not enter approved memory.</p>
+        <div class="field">
+          <label for="reject-reason">Reason</label>
+          <textarea id="reject-reason" name="reason" rows="3" placeholder="Optional note for the audit trail"></textarea>
+          <p class="field-help">The raw source remains in the local archive until an operator explicitly archives or removes it.</p>
+        </div>
+        <div class="dialog-actions">
+          <button class="button button-secondary" value="cancel" type="submit">Cancel</button>
+          <button class="button button-danger" id="confirm-reject" value="confirm" type="submit">Reject draft</button>
+        </div>
+      </form>
+    </dialog>
+
+    <div class="live-region" id="live-region" role="status" aria-live="polite" aria-atomic="true"></div>
+
+    <noscript>
+      <div class="noscript">Chronicle needs JavaScript for review, search, and archive navigation.</div>
+    </noscript>
+  </body>
+</html>
