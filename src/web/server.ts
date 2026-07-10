@@ -31,6 +31,7 @@ import {
 } from '../source-catalog.js';
 import { summarizeSource, type SourceSummary } from '../summarize.js';
 import {
+  createTask,
   listTasks,
   readTask,
   updateTask,
@@ -1120,6 +1121,36 @@ async function handleTaskRoute(
     }
     const tasks = await listTasks({ workspaceId, status, owner });
     sendJson(res, 200, { tasks, workspaceId, status });
+    return true;
+  }
+  if (pathname === '/api/tasks' && method === 'POST') {
+    const body = await readBody(req);
+    const allowed = new Set(['task', 'owner']);
+    const unexpected = Object.keys(body).filter((key) => !allowed.has(key));
+    if (unexpected.length > 0) {
+      throw new NoteAccessError(`Unsupported task field: ${unexpected[0]}`, 400);
+    }
+    for (const field of ['task', 'owner'] as const) {
+      if (field in body && typeof body[field] !== 'string') {
+        throw new NoteAccessError(`Task ${field} must be a string.`, 400);
+      }
+    }
+    const taskText = typeof body.task === 'string' ? body.task.normalize('NFKC').trim() : '';
+    if (!taskText || taskText.length > 4_000 || /[\0-\x1f\x7f]/.test(taskText)) {
+      throw new NoteAccessError('Task text must be 1-4000 printable characters.', 400);
+    }
+    const owner = typeof body.owner === 'string' ? body.owner.normalize('NFKC').trim() : '';
+    if (owner && (owner.length > 200 || /[\0-\x1f\x7f]/.test(owner))) {
+      throw new NoteAccessError('Task owner must be at most 200 printable characters.', 400);
+    }
+    const task = await createTask({
+      task: taskText,
+      owner: owner || undefined,
+      workspaceId,
+      origin: 'web',
+    });
+    setRevisionHeader(res, task);
+    sendJson(res, 201, { task, created: true });
     return true;
   }
 

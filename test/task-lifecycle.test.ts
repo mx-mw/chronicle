@@ -4,6 +4,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { test } from 'node:test';
 import {
+  createTask,
   listTasks,
   planApprovedActionTask,
   readTask,
@@ -406,5 +407,80 @@ test('task files fail closed when embedded identity disagrees with their workspa
   await assert.rejects(
     listTasks({ workspaceId: 'identity-a', status: 'all' }),
     /Task identity does not match its workspace path/,
+  );
+});
+
+test('directly created tasks carry an origin instead of meeting sources', async (t) => {
+  const previousKb = process.env.KB_DIR;
+  const root = await mkdtemp(path.join(os.tmpdir(), 'chronicle-tasks-'));
+  process.env.KB_DIR = root;
+  t.after(() => {
+    if (previousKb === undefined) delete process.env.KB_DIR;
+    else process.env.KB_DIR = previousKb;
+  });
+
+  const created = await createTask({
+    workspaceId: 'alpha',
+    task: 'Sketch the kanban view.',
+    owner: 'Max',
+    origin: 'web',
+    now: '2026-07-11T01:00:00.000Z',
+  });
+  assert.equal(created.status, 'open');
+  assert.equal(created.revision, 1);
+  assert.equal(created.origin, 'web');
+  assert.deepEqual(created.sources, []);
+
+  // Round-trips through disk and the list API.
+  assert.deepEqual(await listTasks({ workspaceId: 'alpha' }), [created]);
+  assert.deepEqual(await readTask(created.id, { workspaceId: 'alpha' }), created);
+
+  // Owner defaults, origin defaults to manual.
+  const defaulted = await createTask({
+    workspaceId: 'alpha',
+    task: 'Write the ingest routing spec.',
+    now: '2026-07-11T01:05:00.000Z',
+  });
+  assert.equal(defaulted.owner, 'Unassigned');
+  assert.equal(defaulted.origin, 'manual');
+
+  // An identical open task is a conflict, not a silent duplicate.
+  await assert.rejects(
+    createTask({ workspaceId: 'alpha', task: 'Sketch the kanban view.', owner: 'Max' }),
+    /identical open task already exists/,
+  );
+
+  // ...but the same text is fine once the original is done.
+  const done = await updateTask(created.id, { status: 'done' }, {
+    workspaceId: 'alpha',
+    expectedRevision: 1,
+    now: '2026-07-11T02:00:00.000Z',
+  });
+  assert.equal(done.status, 'done');
+  const again = await createTask({
+    workspaceId: 'alpha',
+    task: 'Sketch the kanban view.',
+    owner: 'Max',
+    now: '2026-07-11T02:10:00.000Z',
+  });
+  assert.notEqual(again.id, created.id);
+
+  // Sourceless tasks still complete and reopen through the normal lifecycle.
+  const reopened = await updateTask(again.id, { status: 'done' }, {
+    workspaceId: 'alpha',
+    expectedRevision: 1,
+    now: '2026-07-11T03:00:00.000Z',
+  }).then((task) => updateTask(task.id, { status: 'open' }, {
+    workspaceId: 'alpha',
+    expectedRevision: 2,
+    now: '2026-07-11T03:05:00.000Z',
+  }));
+  assert.equal(reopened.status, 'open');
+  assert.equal(reopened.completedAt, undefined);
+
+  // A task with neither sources nor origin fails closed on load.
+  assert.throws(
+    () => serializeTask({ ...created, origin: undefined } as ChronicleTask),
+    /at least one source or a creation origin/,
   );
 });

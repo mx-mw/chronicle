@@ -366,6 +366,46 @@ test('HTTP review and note endpoints enforce conflicts and workspace containment
     const doneTasks = await fetch(`${base}/api/tasks?status=done`, { headers });
     assert.equal((await doneTasks.json() as { tasks: unknown[] }).tasks.length, 1);
 
+    const createdTask = await fetch(`${base}/api/tasks`, {
+      method: 'POST',
+      headers: { ...headers, 'Content-Type': 'application/json', Origin: base },
+      body: JSON.stringify({ task: 'Draft the kanban view.', owner: 'Max' }),
+    });
+    assert.equal(createdTask.status, 201);
+    assert.equal(createdTask.headers.get('etag'), '"1"');
+    const createdTaskBody = await createdTask.json() as {
+      task: { id: string; status: string; origin?: string; owner: string; sources: unknown[] };
+    };
+    assert.equal(createdTaskBody.task.status, 'open');
+    assert.equal(createdTaskBody.task.origin, 'web');
+    assert.equal(createdTaskBody.task.owner, 'Max');
+    assert.deepEqual(createdTaskBody.task.sources, []);
+
+    const duplicateTask = await fetch(`${base}/api/tasks`, {
+      method: 'POST',
+      headers: { ...headers, 'Content-Type': 'application/json', Origin: base },
+      body: JSON.stringify({ task: 'Draft the kanban view.', owner: 'Max' }),
+    });
+    assert.equal(duplicateTask.status, 409);
+
+    const emptyCreate = await fetch(`${base}/api/tasks`, {
+      method: 'POST',
+      headers: { ...headers, 'Content-Type': 'application/json', Origin: base },
+      body: JSON.stringify({ task: '   ' }),
+    });
+    assert.equal(emptyCreate.status, 400);
+
+    const strayFieldCreate = await fetch(`${base}/api/tasks`, {
+      method: 'POST',
+      headers: { ...headers, 'Content-Type': 'application/json', Origin: base },
+      body: JSON.stringify({ task: 'Valid text.', origin: 'spoofed' }),
+    });
+    assert.equal(strayFieldCreate.status, 400);
+
+    const openAfterCreate = await fetch(`${base}/api/tasks?status=open`, { headers });
+    const openAfterCreateBody = await openAfterCreate.json() as { tasks: Array<{ id: string }> };
+    assert.deepEqual(openAfterCreateBody.tasks.map((task) => task.id), [createdTaskBody.task.id]);
+
     const crossWorkspaceTask = await fetch(`${base}/api/tasks/${seededTask.task.id}`, {
       headers: { 'X-Chronicle-Workspace': otherWorkspace },
     });

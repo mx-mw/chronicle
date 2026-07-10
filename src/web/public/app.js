@@ -26,6 +26,10 @@
     sourceDetailLoading: false,
     sourceDetailError: '',
     sourceCache: new Map(),
+    tasks: [],
+    taskFilter: 'open',
+    taskBusyId: null,
+    taskFormBusy: false,
     capturePreview: null,
     captureStatus: 'idle',
     captureError: '',
@@ -1602,6 +1606,144 @@
     }).join('')}</ul>`;
   }
 
+  function taskItemMarkup(task) {
+    const done = task.status === 'done';
+    const busy = state.taskBusyId === task.id;
+    const latestSource = safeArray(task.sources).at(-1);
+    const provenance = latestSource
+      ? `<button class="button button-text task-source" type="button" data-note-file="${escapeHtml(latestSource.transcriptPath)}">From meeting ${escapeHtml(formatDate(latestSource.date))}</button>`
+      : `<span class="task-origin">${escapeHtml(task.origin || 'manual')}</span>`;
+    const ownerChip = task.owner && task.owner !== 'Unassigned'
+      ? `<span class="task-owner">${escapeHtml(task.owner)}</span>`
+      : '';
+    return `
+      <li class="task-item${done ? ' is-done' : ''}">
+        <button
+          class="task-toggle"
+          type="button"
+          role="checkbox"
+          aria-checked="${done}"
+          aria-label="${done ? 'Reopen task' : 'Mark task done'}"
+          data-task-toggle="${escapeHtml(task.id)}"
+          data-task-revision="${escapeHtml(String(task.revision))}"
+          data-task-status="${escapeHtml(task.status)}"
+          ${busy ? 'disabled' : ''}
+        >${done ? '✓' : ''}</button>
+        <div class="task-body">
+          <span class="task-text">${escapeHtml(task.task)}</span>
+          <span class="task-meta">${ownerChip}${provenance}${done && task.completedAt ? `<span class="task-done-at">Done ${escapeHtml(formatDate(task.completedAt))}</span>` : ''}</span>
+        </div>
+      </li>`;
+  }
+
+  async function renderTasks(options = {}) {
+    const sequence = ++state.renderSequence;
+    state.view = 'tasks';
+    setActiveNavigation('tasks');
+    setMain(loadingMarkup('Loading tasks'), true);
+    try {
+      const data = await api(`/api/tasks?status=${encodeURIComponent(state.taskFilter)}`);
+      if (sequence !== state.renderSequence) return;
+      state.tasks = safeArray(data.tasks);
+      const filters = ['open', 'done', 'all'].map((filter) => `
+        <button class="mode-button${state.taskFilter === filter ? ' is-active' : ''}" type="button" data-task-filter="${filter}" aria-pressed="${state.taskFilter === filter}">
+          ${filter[0].toUpperCase()}${filter.slice(1)}
+        </button>`).join('');
+      const emptyText = state.taskFilter === 'done'
+        ? 'Nothing has been marked done yet.'
+        : state.taskFilter === 'all'
+          ? 'No tasks yet. Add one below, or approve a meeting with action items.'
+          : 'No open tasks. Add one below, or approve a meeting with action items.';
+      setMain(`
+        <header class="view-header">
+          <h1>Tasks</h1>
+          <p>Everything that still needs doing — captured from meetings or added directly.</p>
+        </header>
+        <section class="task-panel" aria-label="Add a task">
+          <form id="task-form" class="task-form" autocomplete="off">
+            <div class="task-form-fields">
+              <div class="field task-field-text">
+                <label for="task-input">New task</label>
+                <input id="task-input" name="task" type="text" maxlength="4000" placeholder="What needs doing?" required ${state.taskFormBusy ? 'disabled' : ''} />
+              </div>
+              <div class="field task-field-owner">
+                <label for="task-owner">Owner <span class="field-optional">optional</span></label>
+                <input id="task-owner" name="owner" type="text" maxlength="200" placeholder="Unassigned" ${state.taskFormBusy ? 'disabled' : ''} />
+              </div>
+              <button class="button button-primary" type="submit" ${state.taskFormBusy ? 'disabled' : ''}>Add task</button>
+            </div>
+            <p class="field-error" id="task-form-error" hidden></p>
+          </form>
+        </section>
+        <section class="task-list-panel" aria-label="Task list">
+          <div class="mode-switch task-filter" role="group" aria-label="Filter tasks">${filters}</div>
+          ${state.tasks.length
+            ? `<ul class="task-list">${state.tasks.map((task) => taskItemMarkup(task)).join('')}</ul>`
+            : `<p class="field-help task-empty">${escapeHtml(emptyText)}</p>`}
+        </section>`);
+    } catch (error) {
+      if (sequence !== state.renderSequence) return;
+      setMain(`
+        <header class="view-header"><h1>Tasks</h1></header>
+        ${stateMarkup('error', 'Could not load tasks', error instanceof Error ? error.message : 'The task list failed.', '<button class="button button-secondary" type="button" data-retry-view="tasks">Retry</button>')}`);
+    } finally {
+      elements.main.setAttribute('aria-busy', 'false');
+    }
+  }
+
+  function taskFormError(message) {
+    const error = document.getElementById('task-form-error');
+    if (!error) return;
+    error.textContent = message;
+    error.hidden = !message;
+  }
+
+  async function submitNewTask(form) {
+    if (state.taskFormBusy) return;
+    const taskText = (form.elements.task?.value || '').trim();
+    const owner = (form.elements.owner?.value || '').trim();
+    if (!taskText) {
+      taskFormError('Describe the task first.');
+      return;
+    }
+    state.taskFormBusy = true;
+    taskFormError('');
+    try {
+      await api('/api/tasks', {
+        method: 'POST',
+        body: JSON.stringify({ task: taskText, ...(owner ? { owner } : {}) }),
+      });
+      state.taskFormBusy = false;
+      announce('Task added.');
+      if (state.taskFilter === 'done') state.taskFilter = 'open';
+      await renderTasks({ force: true });
+      document.getElementById('task-input')?.focus();
+    } catch (error) {
+      state.taskFormBusy = false;
+      taskFormError(error instanceof Error ? error.message : 'Could not add the task.');
+      form.elements.task?.removeAttribute('disabled');
+    }
+  }
+
+  async function toggleTask(id, revision, currentStatus) {
+    if (state.taskBusyId) return;
+    state.taskBusyId = id;
+    const nextStatus = currentStatus === 'done' ? 'open' : 'done';
+    try {
+      await api(`/api/tasks/${encodeURIComponent(id)}`, {
+        method: 'PATCH',
+        body: JSON.stringify({ status: nextStatus, expectedRevision: revision }),
+      });
+      state.taskBusyId = null;
+      announce(nextStatus === 'done' ? 'Task marked done.' : 'Task reopened.');
+      await renderTasks({ force: true });
+    } catch (error) {
+      state.taskBusyId = null;
+      announce(error instanceof Error ? error.message : 'Could not update the task.');
+      await renderTasks({ force: true });
+    }
+  }
+
   async function renderHome(options = {}) {
     const sequence = ++state.renderSequence;
     state.view = 'home';
@@ -1854,7 +1996,7 @@
     if (view === 'records' || view === 'topics') return { view, file: detail || undefined };
     if (view === 'library') return { view, id: detail || undefined };
     if (view === 'home' || view === 'digest') return { view: 'home' };
-    if (['capture', 'trust'].includes(view)) return { view };
+    if (['capture', 'trust', 'tasks'].includes(view)) return { view };
     return { view: 'home' };
   }
 
@@ -1873,6 +2015,7 @@
     else if (route.view === 'capture') renderCapture();
     else if (route.view === 'library') await renderSources({ id: route.id, force: options.force });
     else if (route.view === 'records' || route.view === 'topics') await renderApprovedLibrary(route.view, { file: route.file, force: options.force });
+    else if (route.view === 'tasks') await renderTasks(options);
     else if (route.view === 'trust') await renderTrust(options);
     state.lastSafeHash = location.hash || '#home';
     if (options.focus !== false) focusMain(Boolean(route.id || route.file));
@@ -1951,6 +2094,17 @@
       goToView(target.dataset.backToLibrary);
     } else if (target.matches('[data-note-file]')) {
       goToNote(target.dataset.noteFile);
+    } else if (target.matches('[data-task-toggle]')) {
+      toggleTask(
+        target.dataset.taskToggle,
+        Number(target.dataset.taskRevision),
+        target.dataset.taskStatus,
+      );
+    } else if (target.matches('[data-task-filter]')) {
+      if (state.taskFilter !== target.dataset.taskFilter) {
+        state.taskFilter = target.dataset.taskFilter;
+        renderTasks({ force: true });
+      }
     } else if (target.matches('[data-retry-view]')) {
       renderRoute({ force: true, focus: true });
     } else if (target.matches('[data-close-drawer]')) {
@@ -1990,6 +2144,9 @@
     } else if (event.target instanceof HTMLFormElement && event.target.id === 'capture-form') {
       event.preventDefault();
       createCapturePreview(event.target);
+    } else if (event.target instanceof HTMLFormElement && event.target.id === 'task-form') {
+      event.preventDefault();
+      submitNewTask(event.target);
     }
   });
 

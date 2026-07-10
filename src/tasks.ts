@@ -1,3 +1,4 @@
+import { randomUUID } from 'node:crypto';
 import { readdir } from 'node:fs/promises';
 import path from 'node:path';
 import { config } from './config.js';
@@ -31,6 +32,12 @@ export interface ChronicleTask {
   status: TaskStatus;
   owner: string;
   task: string;
+  /**
+   * Where a task without meeting sources came from: 'web', 'manual', or a
+   * future ingest route/skill name. Meeting-derived tasks carry provenance in
+   * `sources` instead and leave this unset.
+   */
+  origin?: string;
   createdAt: string;
   updatedAt: string;
   completedAt?: string;
@@ -60,6 +67,15 @@ export type ApprovedActionTaskPlan =
   | { outcome: 'created'; task: ChronicleTask }
   | { outcome: 'carried_over'; task: ChronicleTask }
   | { outcome: 'unchanged'; task: ChronicleTask };
+
+export interface CreateTaskInput {
+  task: string;
+  owner?: string;
+  workspaceId?: string;
+  /** e.g. 'web', 'manual', or a skill/ingest route name. */
+  origin?: string;
+  now?: Date | string;
+}
 
 export interface ListTaskOptions {
   workspaceId?: string;
@@ -239,8 +255,11 @@ function normalizeLoadedTask(value: ChronicleTask): ChronicleTask {
   if (!Number.isSafeInteger(value.revision) || value.revision < 1) {
     throw new Error('Task revision must be a positive integer');
   }
-  if (!Array.isArray(value.sources) || value.sources.length === 0) {
-    throw new Error('Task must retain at least one source');
+  const origin = value.origin === undefined
+    ? undefined
+    : printableValue(value.origin, 'Task origin', 100);
+  if (!Array.isArray(value.sources) || (value.sources.length === 0 && origin === undefined)) {
+    throw new Error('Task must retain at least one source or a creation origin');
   }
   const status = taskStatus(value.status);
   const completedAt = value.completedAt === undefined
@@ -255,6 +274,7 @@ function normalizeLoadedTask(value: ChronicleTask): ChronicleTask {
     status,
     owner: printableValue(value.owner, 'Task owner', 200),
     task: printableValue(value.task, 'Task text', 4_000),
+    ...(origin === undefined ? {} : { origin }),
     createdAt,
     updatedAt,
     ...(status === 'done' ? { completedAt } : {}),
@@ -409,6 +429,49 @@ export async function readTask(
 ): Promise<ChronicleTask> {
   const workspaceId = normalizeTaskWorkspaceId(options.workspaceId);
   return withTaskStoreLock(() => readTaskUnlocked(id, workspaceId));
+}
+
+export const DEFAULT_TASK_OWNER = 'Unassigned';
+
+/**
+ * Create a task directly — from the web UI, a CLI, or any future ingest route
+ * that decides a piece of captured data is a task. Unlike approved-action
+ * tasks there is no meeting provenance; the `origin` field records where the
+ * task came from instead.
+ */
+export async function createTask(input: CreateTaskInput): Promise<ChronicleTask> {
+  const workspaceId = normalizeTaskWorkspaceId(input.workspaceId);
+  const owner = printableValue(input.owner ?? DEFAULT_TASK_OWNER, 'Task owner', 200);
+  const taskText = printableValue(input.task, 'Task text', 4_000);
+  const origin = printableValue(input.origin ?? 'manual', 'Task origin', 100);
+  const now = timestamp(input.now);
+  return withTaskStoreLock(async () => {
+    const matchKey = taskMatchKey(owner, taskText);
+    const duplicate = (await listTasksUnlocked({ workspaceId, status: 'open' })).find(
+      (candidate) => taskMatchKey(candidate.owner, candidate.task) === matchKey,
+    );
+    if (duplicate) {
+      throw new TaskStateConflictError(
+        `An identical open task already exists (${duplicate.id})`,
+      );
+    }
+    const task: ChronicleTask = {
+      schemaVersion: TASK_SCHEMA_VERSION,
+      id: randomUUID(),
+      workspaceId,
+      revision: 1,
+      status: 'open',
+      owner,
+      task: taskText,
+      origin,
+      createdAt: now,
+      updatedAt: now,
+      sources: [],
+    };
+    await ensurePrivateDirectory(taskDirectory(workspaceId));
+    await atomicWriteJson(taskFilePath(task.id, workspaceId), task);
+    return normalizeLoadedTask(task);
+  });
 }
 
 /** Standalone materializer for imports/backfills. Approval should use the pure plan helper. */

@@ -1516,3 +1516,133 @@ select:focus {
     transition-duration: 0.01ms !important;
   }
 }
+
+/* Tasks view */
+
+.task-panel {
+  margin-block-end: 1.25rem;
+  padding: 1rem 1.1rem;
+  border: 1px solid var(--rule);
+  border-radius: 12px;
+  background: var(--panel);
+}
+
+.task-form-fields {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(8rem, 14rem) auto;
+  gap: 0.75rem;
+  align-items: end;
+}
+
+.field-optional {
+  color: var(--muted);
+  font-weight: 400;
+}
+
+.task-filter {
+  grid-template-columns: repeat(3, minmax(4rem, 6rem));
+  inline-size: fit-content;
+  margin-block-end: 0.9rem;
+}
+
+.task-list {
+  margin: 0;
+  padding: 0;
+  list-style: none;
+  display: grid;
+  gap: 0.45rem;
+}
+
+.task-item {
+  display: flex;
+  gap: 0.75rem;
+  align-items: flex-start;
+  padding: 0.7rem 0.9rem;
+  border: 1px solid var(--rule);
+  border-radius: 10px;
+  background: var(--panel);
+}
+
+.task-toggle {
+  flex: 0 0 auto;
+  inline-size: 1.4rem;
+  block-size: 1.4rem;
+  margin-block-start: 0.1rem;
+  border: 2px solid var(--muted);
+  border-radius: 6px;
+  background: transparent;
+  color: var(--accent-ink);
+  cursor: pointer;
+  font-size: 0.85rem;
+  font-weight: 700;
+  line-height: 1;
+  display: grid;
+  place-items: center;
+  transition-property: background-color, border-color;
+  transition-duration: 150ms;
+}
+
+.task-toggle[aria-checked='true'] {
+  border-color: var(--accent);
+  background: var(--accent);
+}
+
+.task-toggle:disabled {
+  opacity: 0.5;
+  cursor: progress;
+}
+
+.task-body {
+  display: grid;
+  gap: 0.25rem;
+  min-inline-size: 0;
+}
+
+.task-text {
+  color: var(--ink);
+  overflow-wrap: anywhere;
+}
+
+.task-item.is-done .task-text {
+  color: var(--muted);
+  text-decoration: line-through;
+}
+
+.task-meta {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.35rem 0.75rem;
+  align-items: baseline;
+  color: var(--muted);
+  font-size: 0.78rem;
+}
+
+.task-owner {
+  padding: 0.1rem 0.5rem;
+  border-radius: 999px;
+  background: var(--panel-subtle);
+  color: var(--ink);
+  font-weight: 700;
+}
+
+.task-origin {
+  text-transform: lowercase;
+  letter-spacing: 0.02em;
+}
+
+.task-meta .task-source {
+  min-height: 0;
+  padding: 0;
+  font-size: inherit;
+}
+
+.task-empty {
+  margin: 0;
+}
+
+@media (max-width: 48rem) {
+  .task-form-fields {
+    grid-template-columns: 1fr;
+    align-items: stretch;
+  }
+}
