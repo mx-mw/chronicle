@@ -229,6 +229,14 @@ readiness; the next search or `npm run index` repairs it.
 The additive task and processing endpoints used by the frontend are documented
 in [`docs/frontend-api.md`](docs/frontend-api.md).
 
+Future product work is captured in two discussion documents:
+
+- [Multi-source capture, Discord ingestion, Reels, and Library plan](docs/multisource-capture-plan.md)
+- [Federated personal knowledge and project sharing proposal](docs/federated-sharing-proposal.md)
+
+The sharing proposal is intentionally blocked until Ethan and Max agree on
+identity, trust, visibility, and project-space rules.
+
 ## Ingest other sources
 
 Chronicle supports local audio/video, PDFs, text files, web articles, and
