@@ -70,6 +70,10 @@ a local OpenAI-compatible server or, only when selected explicitly, Anthropic.
   matches directly.
 - **Digest:** review the last week of decisions, actions, questions, and pending
   drafts.
+- **Tasks:** track approved action items through open/done lifecycle state while
+  preserving their source meetings and carryover history.
+- **Processing:** inspect active captures and every transcription/distillation
+  stage without waiting for a final draft.
 - **Trust:** inspect policy, model, index, and archive readiness.
 - **Discord:** consent-aware recording plus guild-scoped recall.
 - **CLI:** batch ingest, review, retrieval, indexing, diagnostics, digest, and
@@ -215,11 +219,15 @@ When `WORKSPACE_ID` already equals the Discord guild ID, those `--workspace`
 flags can be omitted. The browser uses `WEB_WORKSPACE_ID`; it must match the
 guild ID to show Discord drafts in Inbox.
 
-An approval writes one record, updates its topic logs, rebuilds the Markdown
-map, and refreshes the derived search index. Repeating an approval is
+An approval writes one record, updates its topic logs, materializes approved
+action items as durable tasks, rebuilds the Markdown map, and refreshes the
+derived search index. Repeating an approval is
 idempotent. Revision checks prevent one reviewer from overwriting another. If
 index refresh fails, Chronicle marks the index stale instead of reporting false
 readiness; the next search or `npm run index` repairs it.
+
+The additive task and processing endpoints used by the frontend are documented
+in [`docs/frontend-api.md`](docs/frontend-api.md).
 
 ## Ingest other sources
 

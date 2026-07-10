@@ -36,6 +36,17 @@ needs_review -> needs_review (edited revision)
 
 Approval is the only path that mutates approved record and topic Markdown.
 
+### Tasks
+
+```text
+approved action -> open -> done
+                       -> open (explicit revisioned reopen only)
+```
+
+Repeated approved actions append source meetings to an existing open task.
+Matching work after completion creates a new task instead of silently reopening
+the completed record. Task creation participates in the approval journal.
+
 ## Stable identities
 
 - Every source and recording receives a UUID before expensive processing begins.
@@ -54,6 +65,9 @@ kb/
     approval-transactions/
     tombstones/
       <workspace-key>/
+    tasks/
+      <workspace-key>/
+        <task-id>.json
     index-state.json
     ledger.db
     write.lock

@@ -27,10 +27,11 @@ test('approval failpoints roll back records, topics, draft, and index generation
   try {
     const { buildIndex, getIndexHealth, search } = await import('../src/store.js');
     const { approveDraft, readDraft, stageSourceDraft, workspaceRoot } = await import('../src/kb.js');
+    const { listTasks } = await import('../src/tasks.js');
     await buildIndex();
     assert.equal(getIndexHealth().fresh, true);
 
-    for (const failureKind of ['topic', 'draft'] as const) {
+    for (const failureKind of ['topic', 'task', 'draft'] as const) {
       const rawText = `Raw transcript for ${failureKind} failure.`;
       const draft = await stageSourceDraft(
         {
@@ -38,7 +39,7 @@ test('approval failpoints roll back records, topics, draft, and index generation
           slug: `atomic-${failureKind}`,
           summary: 'This must remain review-only after an injected failure.',
           decisions: [],
-          action_items: [],
+          action_items: [{ owner: 'Max', task: `Verify ${failureKind} rollback.` }],
           open_questions: [],
           facts: [
             {
@@ -76,6 +77,7 @@ test('approval failpoints roll back records, topics, draft, and index generation
       const workspace = workspaceRoot('atomic-team');
       assert.deepEqual(await listMarkdown(path.join(workspace, 'meetings')), []);
       assert.deepEqual(await listMarkdown(path.join(workspace, 'topics')), []);
+      assert.deepEqual(await listTasks({ workspaceId: 'atomic-team', status: 'all' }), []);
       assert.deepEqual(
         await readdir(path.join(root, '.chronicle', 'approval-transactions')).catch(
           (error: NodeJS.ErrnoException) => {
@@ -99,6 +101,69 @@ test('approval failpoints roll back records, topics, draft, and index generation
         new RegExp(draft.id),
       );
     }
+
+    const seedDraft = await stageSourceDraft(
+      {
+        title: 'Carryover seed',
+        slug: 'carryover-seed',
+        summary: 'A seed task for rollback verification.',
+        decisions: [],
+        action_items: [{ owner: 'Max', task: 'Verify carryover rollback.' }],
+        open_questions: [],
+        facts: [],
+      },
+      'Seed task transcript.',
+      {
+        date: '2026-07-10',
+        kind: 'meeting',
+        origin: 'discord:carryover-seed',
+        sourceEventId: 'session-carryover-seed',
+      },
+      { workspaceId: 'atomic-team', operationId: 'session-carryover-seed' },
+    );
+    await approveDraft(seedDraft.id, { workspaceId: 'atomic-team' });
+    const seedTask = (await listTasks({ workspaceId: 'atomic-team', status: 'all' }))[0];
+
+    const carryoverDraft = await stageSourceDraft(
+      {
+        title: 'Carryover retry',
+        slug: 'carryover-retry',
+        summary: 'A later meeting repeated the task.',
+        decisions: [],
+        action_items: [{ owner: 'Max', task: 'Verify carryover rollback.' }],
+        open_questions: [],
+        facts: [],
+      },
+      'Carryover retry transcript.',
+      {
+        date: '2026-07-11',
+        kind: 'meeting',
+        origin: 'discord:carryover-retry',
+        sourceEventId: 'session-carryover-retry',
+      },
+      { workspaceId: 'atomic-team', operationId: 'session-carryover-retry' },
+    );
+    await assert.rejects(
+      approveDraft(carryoverDraft.id, {
+        workspaceId: 'atomic-team',
+        beforeMutation(context) {
+          if (context.kind === 'draft') throw new Error('injected carryover commit failure');
+        },
+      }),
+      /injected carryover commit failure/,
+    );
+    assert.deepEqual(
+      (await listTasks({ workspaceId: 'atomic-team', status: 'all' }))[0],
+      seedTask,
+    );
+    assert.equal(
+      (await readDraft(carryoverDraft.id, { workspaceId: 'atomic-team' })).status,
+      'needs_review',
+    );
+    assert.equal(
+      (await listMarkdown(path.join(workspaceRoot('atomic-team'), 'meetings'))).length,
+      1,
+    );
   } finally {
     globalThis.fetch = originalFetch;
   }

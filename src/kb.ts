@@ -18,6 +18,14 @@ import {
 import { appendLedgerEvent } from './ledger.js';
 import type { MeetingSummary, SourceSummary } from './summarize.js';
 import type { SourceKind } from './sources/index.js';
+import {
+  listTasksUnlocked,
+  planApprovedActionTask,
+  serializeTask,
+  taskDirectory,
+  taskFilePath,
+  type ChronicleTask,
+} from './tasks.js';
 
 export const DEFAULT_WORKSPACE_ID = 'default';
 const DRAFT_SCHEMA_VERSION = 2;
@@ -59,6 +67,7 @@ export interface ApprovalResult extends WrittenMeeting {
   contentHash: string;
   revision: number;
   status: 'approved';
+  taskIds?: string[];
 }
 
 export interface ReviewDraft {
@@ -121,7 +130,7 @@ export interface RejectOptions extends DraftLookupOptions {
 
 export interface ApprovalMutationContext {
   index: number;
-  kind: 'index_state' | 'record' | 'topic' | 'draft';
+  kind: 'index_state' | 'record' | 'topic' | 'task' | 'draft';
   path: string;
 }
 
@@ -346,6 +355,14 @@ function kbRelativePath(absolutePath: string): string {
   const relative = path.relative(root, target);
   if (!relative || relative === '..' || relative.startsWith(`..${path.sep}`) || path.isAbsolute(relative)) {
     throw new Error(`Approval mutation escapes the knowledge base: ${absolutePath}`);
+  }
+  return relative.split(path.sep).join('/');
+}
+
+function workspaceRelativePath(root: string, absolutePath: string): string {
+  const relative = path.relative(path.resolve(root), path.resolve(absolutePath));
+  if (!relative || relative === '..' || relative.startsWith(`..${path.sep}`) || path.isAbsolute(relative)) {
+    throw new Error(`Approved artifact escapes its workspace: ${absolutePath}`);
   }
   return relative.split(path.sep).join('/');
 }
@@ -680,8 +697,27 @@ function validateSummary(summary: SourceSummary): SourceSummary {
     decisions: uniqueStrings(summary.decisions),
     action_items: (summary.action_items ?? [])
       .filter((item) => item?.owner?.trim() && item?.task?.trim())
-      .map((item) => ({ owner: item.owner.trim(), task: item.task.trim() })),
+      .map((item) => {
+        const carryoverTaskId = item.carryover_task_id?.trim();
+        if (
+          carryoverTaskId &&
+          !/^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(
+            carryoverTaskId,
+          )
+        ) {
+          throw new Error(`Invalid carryover task id: ${carryoverTaskId}`);
+        }
+        return {
+          owner: item.owner.trim(),
+          task: item.task.trim(),
+          ...(carryoverTaskId ? { carryover_task_id: carryoverTaskId } : {}),
+        };
+      }),
     open_questions: uniqueStrings(summary.open_questions),
+    ...(() => {
+      const highlights = uniqueStrings(summary.highlights);
+      return highlights.length ? { highlights } : {};
+    })(),
     facts: (summary.facts ?? [])
       .filter((fact) => fact?.topic?.trim() && fact?.fact?.trim())
       .map((fact) => ({
@@ -923,6 +959,8 @@ function renderApprovedNote(
   topics: { path: string; name: string }[],
 ): string {
   const { summary, meta } = draft;
+  const rawName = path.basename(draft.rawCapture.relativePath, '.md');
+  const sourceLink = `[[transcripts/${rawName}]]`;
   let note =
     yamlFrontmatter({
       name: noteName,
@@ -938,21 +976,32 @@ function renderApprovedNote(
       attribution: meta.attribution ?? [],
       duration_minutes: meta.durationMinutes,
     }) +
-    `# ${summary.title}\n\n${metaLine(meta)}\n\n${summary.summary}\n`;
+    `# ${summary.title}\n\n${metaLine(meta)}\n`;
+  if (summary.summary) {
+    note += `\n${summary.summary} ${sourceLink}\n`;
+  }
   if (summary.decisions.length) {
-    note += `\n## Decisions\n${summary.decisions.map((decision) => `- ${decision}`).join('\n')}\n`;
+    note += `\n## Decisions\n${summary.decisions
+      .map((decision) => `- ${decision} ${sourceLink}`)
+      .join('\n')}\n`;
   }
   if (summary.action_items.length) {
     note += `\n## Action items\n${summary.action_items
-      .map((item) => `- [ ] **${item.owner}**: ${item.task}`)
+      .map((item) => `- [ ] **${item.owner}**: ${item.task} ${sourceLink}`)
       .join('\n')}\n`;
   }
   if (summary.open_questions.length) {
-    note += `\n## Open questions\n${summary.open_questions.map((question) => `- ${question}`).join('\n')}\n`;
+    note += `\n## Open questions\n${summary.open_questions
+      .map((question) => `- ${question} ${sourceLink}`)
+      .join('\n')}\n`;
+  }
+  if (summary.highlights?.length) {
+    note += `\n## Source highlights\n${summary.highlights
+      .map((highlight) => `> ${highlight} ${sourceLink}`)
+      .join('\n>\n')}\n`;
   }
   note += `\n## Topics touched\n${topics.map((topic) => `- [[topics/${topic.name}]]`).join('\n') || '_none_'}\n`;
-  const rawName = path.basename(draft.rawCapture.relativePath, '.md');
-  note += `\n## Provenance\n- [[transcripts/${rawName}]]\n`;
+  note += `\n## Provenance\n- ${sourceLink}\n`;
   return note;
 }
 
@@ -1006,6 +1055,7 @@ async function staleIndexStateContent(recordId: string): Promise<string> {
 async function planApprovalUnlocked(draft: ReviewDraft): Promise<ApprovalPlan> {
   const root = workspaceRoot(draft.workspaceId);
   await ensureWorkspaceDirs(draft.workspaceId);
+  const approvedAt = new Date().toISOString();
   const noteName = `${safeDate(draft.meta.date)}-${unicodeSlug(
     draft.summary.slug || draft.summary.title,
     60,
@@ -1072,20 +1122,56 @@ async function planApprovalUnlocked(draft: ReviewDraft): Promise<ApprovalPlan> {
       }) + `# ${entry.title}\n\n${entry.description}\n\n## Log\n`);
     if (!content.endsWith('\n')) content += '\n';
     const known = existingFacts(content);
+    const rawName = path.basename(draft.rawCapture.relativePath, '.md');
+    const sourceLink = `[[transcripts/${rawName}]]`;
     for (const fact of entry.facts) {
       if (known.has(normalizeFact(fact.text))) continue;
-      content += `- ${fact.text} - [[meetings/${noteName}]] (${draft.meta.date}) <!-- chronicle-fact:${fact.hash} -->\n`;
+      content += `- ${fact.text} - [[meetings/${noteName}]] ${sourceLink} (${draft.meta.date}) <!-- chronicle-fact:${fact.hash} -->\n`;
       known.add(normalizeFact(fact.text));
     }
     mutations.push({ kind: 'topic', path: target.path, content });
     topicPaths.push(target.path);
   }
   result.topicPaths = topicPaths;
+  const taskIds: string[] = [];
+  if (draft.summary.action_items.length > 0) {
+    await ensurePrivateDirectory(taskDirectory(draft.workspaceId));
+    const meetingRelativePath = workspaceRelativePath(root, meetingPath);
+    const transcriptRelativePath = workspaceRelativePath(root, draft.rawCapture.path);
+    let tasks: ChronicleTask[] = await listTasksUnlocked({
+      workspaceId: draft.workspaceId,
+      status: 'all',
+    });
+    for (const action of draft.summary.action_items) {
+      const taskPlan = planApprovedActionTask(tasks, {
+        workspaceId: draft.workspaceId,
+        owner: action.owner,
+        task: action.task,
+        carryoverTaskId: action.carryover_task_id,
+        source: {
+          recordId: draft.id,
+          date: draft.meta.date,
+          meetingPath: meetingRelativePath,
+          transcriptPath: transcriptRelativePath,
+        },
+        now: approvedAt,
+      });
+      if (!taskIds.includes(taskPlan.task.id)) taskIds.push(taskPlan.task.id);
+      if (taskPlan.outcome === 'unchanged') continue;
+      tasks = [...tasks.filter((task) => task.id !== taskPlan.task.id), taskPlan.task];
+      mutations.push({
+        kind: 'task',
+        path: taskFilePath(taskPlan.task.id, draft.workspaceId),
+        content: serializeTask(taskPlan.task),
+      });
+    }
+  }
+  result.taskIds = taskIds;
   const approvedDraft: ReviewDraft = {
     ...draft,
     revision: result.revision,
     status: 'approved',
-    updatedAt: new Date().toISOString(),
+    updatedAt: approvedAt,
     approval: result,
   };
   mutations.push({
@@ -1196,6 +1282,7 @@ export async function approveDraft(
       meetingPath: result.meetingPath,
       transcriptPath: result.transcriptPath,
       topicPaths: result.topicPaths,
+      taskIds: result.taskIds ?? [],
     },
   });
   await rebuildIndex(workspaceId).catch((error) => {

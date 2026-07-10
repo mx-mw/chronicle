@@ -16,6 +16,7 @@ import {
   recoverApprovalTransactions,
   stageSourceDraft,
   withKnowledgeReadLock,
+  workspaceRoot,
   type SourceMeta,
 } from '../kb.js';
 import { describeProvider } from '../llm.js';
@@ -25,7 +26,14 @@ import { localDate } from '../reporting.js';
 import { extract, type ExtractedSource, type SourceKind } from '../sources/index.js';
 import { getIndexHealth, search } from '../store.js';
 import { summarizeSource, type SourceSummary } from '../summarize.js';
-import { listSessionManifests } from '../session-manifest.js';
+import {
+  listTasks,
+  readTask,
+  updateTask,
+  type TaskPatch,
+  type TaskStatus,
+} from '../tasks.js';
+import { listSessionManifests, type SessionManifest } from '../session-manifest.js';
 import { renderMarkdown } from './markdown.js';
 import { buildPalaceMap, readNote, NoteAccessError, type NoteSummary } from './notes.js';
 
@@ -268,6 +276,14 @@ function validReviewId(raw: string): string {
   return id;
 }
 
+function validTaskId(raw: string): string {
+  const id = decodeURIComponent(raw);
+  if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(id)) {
+    throw new NoteAccessError('Invalid task identifier', 400);
+  }
+  return id;
+}
+
 function parseRevision(value: unknown): string | number | undefined {
   if (typeof value === 'number' && Number.isFinite(value)) return value;
   if (typeof value !== 'string') return undefined;
@@ -280,10 +296,14 @@ function expectedRevision(req: IncomingMessage, body?: Record<string, unknown>):
   return parseRevision(req.headers['if-match']) ?? parseRevision(body?.expectedRevision);
 }
 
-function requiredRevision(req: IncomingMessage, body?: Record<string, unknown>): number {
+function requiredRevision(
+  req: IncomingMessage,
+  body?: Record<string, unknown>,
+  subject = 'review changes',
+): number {
   const revision = expectedRevision(req, body);
   if (revision === undefined) {
-    throw new NoteAccessError('If-Match or expectedRevision is required for review changes.', 428);
+    throw new NoteAccessError(`If-Match or expectedRevision is required for ${subject}.`, 428);
   }
   if (typeof revision !== 'number' || !Number.isSafeInteger(revision) || revision < 1) {
     throw new NoteAccessError('expectedRevision must be a positive integer.', 400);
@@ -594,6 +614,12 @@ async function buildDigest(workspaceId: string): Promise<Record<string, unknown>
   const recent = map.records.filter((record) => noteDate(record) >= cutoff);
   const openActions: Array<{ text: string; file: string; title: string }> = [];
   const openQuestions: Array<{ text: string; file: string; title: string }> = [];
+  let openTasks: Awaited<ReturnType<typeof listTasks>> = [];
+  try {
+    openTasks = await listTasks({ workspaceId, status: 'open' });
+  } catch {
+    partial.push('Task lifecycle could not be read.');
+  }
 
   for (const record of recent.slice(0, 12)) {
     try {
@@ -616,8 +642,67 @@ async function buildDigest(workspaceId: string): Promise<Record<string, unknown>
     recentRecords: recent.slice(0, 8),
     topicCount: map.topics.length,
     openActions,
+    openTasks,
     openQuestions,
     partial: [...new Set(partial)],
+  };
+}
+
+function processingItem(manifest: SessionManifest): Record<string, unknown> {
+  const terminal = new Set(['completed', 'empty', 'discarded']).has(manifest.stage);
+  let recordPath: string | undefined;
+  if (manifest.meetingPath) {
+    const root = path.resolve(workspaceRoot(manifest.workspace.id));
+    const relative = path.relative(root, path.resolve(manifest.meetingPath));
+    if (relative && relative !== '..' && !relative.startsWith(`..${path.sep}`) && !path.isAbsolute(relative)) {
+      recordPath = relative.split(path.sep).join('/');
+    }
+  }
+  return {
+    id: manifest.id,
+    stage: manifest.stage,
+    terminal,
+    attentionRequired: manifest.stage === 'failed' || manifest.stage === 'needs_review',
+    createdAt: manifest.createdAt,
+    updatedAt: manifest.updatedAt,
+    startedAt: manifest.startedAt,
+    endedAt: manifest.endedAt,
+    durationMs: manifest.durationMs,
+    participantCount: Object.keys(manifest.speakers).length,
+    optedOutCount: manifest.optedOutUserIds.length,
+    warningCount: manifest.warnings.length,
+    warnings: manifest.warnings,
+    attempts: manifest.attempts,
+    recoverable: manifest.recoverable !== false,
+    error: manifest.error,
+    rawCaptureId: manifest.rawCaptureId,
+    draftId: manifest.draftId,
+    recordPath,
+    discardReason: manifest.discardReason,
+  };
+}
+
+async function buildProcessingFeed(workspaceId: string, limit: number): Promise<Record<string, unknown>> {
+  const matching = (await listSessionManifests(config.sessionsDir))
+    .map(({ manifest }) => manifest)
+    .filter((manifest) => manifest.workspace.id === workspaceId)
+    .sort((left, right) => right.updatedAt.localeCompare(left.updatedAt));
+  const inProgressCount = matching.filter((manifest) =>
+    ['connecting', 'recording', 'captured', 'queued', 'transcribing', 'distilling'].includes(
+      manifest.stage,
+    )).length;
+  const attentionCount = matching.filter(
+    (manifest) => manifest.stage === 'failed' || manifest.stage === 'needs_review',
+  ).length;
+  const sessions = matching
+    .slice(0, limit)
+    .map(processingItem);
+  return {
+    workspaceId,
+    totalCount: matching.length,
+    inProgressCount,
+    attentionCount,
+    sessions,
   };
 }
 
@@ -879,6 +964,88 @@ async function handleReviewRoute(
   return true;
 }
 
+function taskPatchFrom(body: Record<string, unknown>): TaskPatch {
+  const source = body.patch && typeof body.patch === 'object' && !Array.isArray(body.patch)
+    ? (body.patch as Record<string, unknown>)
+    : body;
+  const allowed = new Set(['owner', 'task', 'status', 'expectedRevision']);
+  const unexpected = Object.keys(source).filter((key) => !allowed.has(key));
+  if (unexpected.length > 0) {
+    throw new NoteAccessError(`Unsupported task field: ${unexpected[0]}`, 400);
+  }
+  const patch: TaskPatch = {};
+  for (const field of ['owner', 'task'] as const) {
+    if (!(field in source)) continue;
+    if (typeof source[field] !== 'string') {
+      throw new NoteAccessError(`Task ${field} must be a string.`, 400);
+    }
+    const value = source[field].normalize('NFKC').trim();
+    const maximum = field === 'owner' ? 200 : 4_000;
+    if (!value || value.length > maximum || /[\0-\x1f\x7f]/.test(value)) {
+      throw new NoteAccessError(`Task ${field} must be 1-${maximum} printable characters.`, 400);
+    }
+    patch[field] = value;
+  }
+  if ('status' in source) {
+    if (source.status !== 'open' && source.status !== 'done') {
+      throw new NoteAccessError('Task status must be open or done.', 400);
+    }
+    patch.status = source.status;
+  }
+  if (Object.keys(patch).length === 0) {
+    throw new NoteAccessError('Task patch must change owner, task, or status.', 400);
+  }
+  return patch;
+}
+
+async function handleTaskRoute(
+  req: IncomingMessage,
+  res: ServerResponse,
+  url: URL,
+  method: string,
+  workspaceId: string,
+): Promise<boolean> {
+  const { pathname } = url;
+  if (!pathname.startsWith('/api/tasks')) return false;
+  if (pathname === '/api/tasks' && method === 'GET') {
+    const rawStatus = url.searchParams.get('status') ?? 'open';
+    if (rawStatus !== 'open' && rawStatus !== 'done' && rawStatus !== 'all') {
+      throw new NoteAccessError('Task status filter must be open, done, or all.', 400);
+    }
+    const status = rawStatus as TaskStatus | 'all';
+    const rawOwner = url.searchParams.get('owner');
+    const owner = rawOwner?.normalize('NFKC').trim() || undefined;
+    if (owner && (owner.length > 200 || /[\0-\x1f\x7f]/.test(owner))) {
+      throw new NoteAccessError('Task owner filter must be at most 200 printable characters.', 400);
+    }
+    const tasks = await listTasks({ workspaceId, status, owner });
+    sendJson(res, 200, { tasks, workspaceId, status });
+    return true;
+  }
+
+  const match = pathname.match(/^\/api\/tasks\/([^/]+)$/);
+  if (!match) return false;
+  const id = validTaskId(match[1]);
+  if (method === 'GET') {
+    const task = await readTask(id, { workspaceId });
+    setRevisionHeader(res, task);
+    sendJson(res, 200, { task, workspaceId });
+    return true;
+  }
+  if (method === 'PATCH') {
+    const body = await readBody(req);
+    const task = await updateTask(id, taskPatchFrom(body), {
+      workspaceId,
+      expectedRevision: requiredRevision(req, body, 'task changes'),
+    });
+    setRevisionHeader(res, task);
+    sendJson(res, 200, { task, saved: true });
+    return true;
+  }
+  sendJson(res, 405, { error: 'method_not_allowed' });
+  return true;
+}
+
 async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> {
   if (!isTrustedHostHeader(req.headers.host)) {
     return sendJson(res, 421, { error: 'untrusted_host', message: 'Untrusted Host header.' });
@@ -921,6 +1088,15 @@ async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> 
     return sendJson(res, 200, await buildDigest(workspaceId));
   }
 
+  if (method === 'GET' && pathname === '/api/processing') {
+    const rawLimit = url.searchParams.get('limit');
+    const limit = rawLimit === null ? 50 : Number(rawLimit);
+    if (!Number.isSafeInteger(limit) || limit < 1 || limit > 100) {
+      throw new NoteAccessError('Processing limit must be an integer between 1 and 100.', 400);
+    }
+    return sendJson(res, 200, await buildProcessingFeed(workspaceId, limit));
+  }
+
   if (method === 'POST' && pathname === '/api/ingest/preview') {
     return sendJson(res, 200, await createIngestPreview(await readBody(req), workspaceId));
   }
@@ -936,6 +1112,8 @@ async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> 
   if (method === 'POST' && pathname === '/api/ingest/stage') {
     return sendJson(res, 201, await stageIngestPreview(await readBody(req), workspaceId));
   }
+
+  if (await handleTaskRoute(req, res, url, method, workspaceId)) return;
 
   if (await handleReviewRoute(req, res, pathname, method, workspaceId)) return;
 
