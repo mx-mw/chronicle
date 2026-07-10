@@ -3,8 +3,39 @@
 This contract lets frontend work proceed independently from the backend branch.
 The frontend owns `src/web/public/`. Backend work must not edit those files.
 
-All requests are scoped by `X-Chronicle-Workspace`. When the web server is bound
-beyond loopback, send the configured bearer token in `Authorization` as well.
+On loopback, requests are scoped by `X-Chronicle-Workspace`. When the web server
+is bound beyond loopback, send the configured bearer token in `Authorization`.
+Encrypted source routes ignore the workspace header in remote mode and are
+locked to `WEB_WORKSPACE_ID`; the bearer token is operator access, not a
+multi-user sharing or workspace-grant mechanism.
+
+## Encrypted source catalog
+
+`GET /api/sources?limit=24&cursor=<opaque>`
+
+Returns newest-first encrypted-catalog entries for the selected workspace as
+`{ sources, nextCursor, workspaceId }`. `limit` must be 1-100. Treat
+`nextCursor` as opaque and send it unchanged; invalid or expired cursors return
+`400`. When no source encryption key is configured, the list is empty and the
+response includes `available: false` so older Chronicle installs keep working.
+Configured retention is enforced before every source list or detail response;
+the web server also runs an unreferenced hourly retention sweep.
+
+Live entries contain nested `source`, `save`, and optional `analysis` objects.
+The independent states are `source.status`, `save.processingStatus`, and
+`save.reviewStatus`; the frontend must not infer review approval from processing
+success. Discarded entries are content-free tombstones.
+
+`GET /api/sources/:id`
+
+Returns `{ source, workspaceId }`. A source from another workspace returns `404`
+instead of revealing its existence.
+
+`DELETE /api/sources/:id`
+
+Erases source content and returns `{ source: <tombstone>, workspaceId,
+discarded: true }`. The tombstone keeps only encrypted identity, revision,
+timestamps, and status required for idempotency and audit.
 
 ## Processing feed
 

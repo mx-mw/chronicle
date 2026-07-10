@@ -1,5 +1,6 @@
 import 'dotenv/config';
 import { chmodSync, statSync } from 'node:fs';
+import { isIP } from 'node:net';
 import path from 'node:path';
 import type { AccessPolicy } from './policy.js';
 import {
@@ -99,7 +100,52 @@ function positiveSafeIntegerEnv(key: string, fallback: number): number {
   return value;
 }
 
-function accessPolicy(scope: 'RECORD' | 'RECALL'): AccessPolicy {
+function requiredPositiveSafeIntegerEnv(key: string): number {
+  const raw = required(key).trim();
+  const value = Number(raw);
+  if (!Number.isSafeInteger(value) || value < 1) {
+    throw new Error(`${key} must be a positive whole number, got "${raw}".`);
+  }
+  return value;
+}
+
+function requiredPublicUrl(key: string): string {
+  const raw = required(key).trim();
+  let url: URL;
+  try {
+    url = new URL(raw);
+  } catch {
+    throw new Error(`${key} must be a valid public HTTPS URL.`);
+  }
+  if (url.protocol !== 'https:' || url.username || url.password || !url.hostname) {
+    throw new Error(`${key} must be a public HTTPS URL without embedded credentials.`);
+  }
+  const hostname = url.hostname.toLowerCase().replace(/^\[|\]$/g, '').replace(/\.+$/, '');
+  if (
+    hostname === 'localhost' ||
+    hostname.endsWith('.localhost') ||
+    hostname.endsWith('.local') ||
+    !hostname.includes('.') ||
+    isIP(hostname) !== 0
+  ) {
+    throw new Error(`${key} must not point to a loopback, private, or local-only host.`);
+  }
+  return url.toString();
+}
+
+function requiredBase64Key(key: string, bytes: number): string {
+  const raw = required(key).trim();
+  if (!/^[A-Za-z0-9+/]+={0,2}$/.test(raw) || raw.length % 4 !== 0) {
+    throw new Error(`${key} must be standard base64 encoding exactly ${bytes} random bytes.`);
+  }
+  const decoded = Buffer.from(raw, 'base64');
+  if (decoded.length !== bytes || decoded.toString('base64') !== raw) {
+    throw new Error(`${key} must be standard base64 encoding exactly ${bytes} random bytes.`);
+  }
+  return raw;
+}
+
+function accessPolicy(scope: 'RECORD' | 'RECALL' | 'INBOX'): AccessPolicy {
   return {
     guildIds: idList(`${scope}_GUILD_IDS`, `${scope}_ALLOWED_GUILD_IDS`),
     channelIds: idList(`${scope}_CHANNEL_IDS`, `${scope}_ALLOWED_CHANNEL_IDS`),
@@ -195,6 +241,53 @@ export const config = {
   },
   get recallPolicy(): AccessPolicy {
     return accessPolicy('RECALL');
+  },
+  /**
+   * Dedicated text channels can act as explicit Chronicle inboxes. This is
+   * disabled by default because it requires the privileged Message Content
+   * intent and Discord API data-at-rest controls.
+   */
+  get discordInboxEnabled(): boolean {
+    return boolEnv('DISCORD_INBOX_ENABLED', false);
+  },
+  get discordMessageContentEnabled(): boolean {
+    return boolEnv('DISCORD_MESSAGE_CONTENT_ENABLED', false);
+  },
+  get inboxPolicy(): AccessPolicy {
+    const policy = accessPolicy('INBOX');
+    if (policy.guildIds.includes('*') || policy.channelIds.includes('*')) {
+      throw new Error(
+        'INBOX_GUILD_IDS and INBOX_CHANNEL_IDS must name exact IDs; wildcard inbox locations are not allowed.',
+      );
+    }
+    return policy;
+  },
+  get sourceCatalogDir(): string {
+    return path.resolve(process.env.SOURCE_CATALOG_DIR || path.join(config.kbDir, '.sources'));
+  },
+  get sourceEncryptionKey(): string {
+    return requiredBase64Key('SOURCE_ENCRYPTION_KEY', 32);
+  },
+  get inboxRetentionDays(): number {
+    return requiredPositiveSafeIntegerEnv('INBOX_RETENTION_DAYS');
+  },
+  get discordPrivacyPolicyUrl(): string {
+    return requiredPublicUrl('DISCORD_PRIVACY_POLICY_URL');
+  },
+  get discordDataRequestUrl(): string {
+    return requiredPublicUrl('DISCORD_DATA_REQUEST_URL');
+  },
+  get inboxMaxAttachments(): number {
+    return positiveSafeIntegerEnv('INBOX_MAX_ATTACHMENTS', 10);
+  },
+  get inboxMaxAttachmentBytes(): number {
+    return positiveSafeIntegerEnv('INBOX_MAX_ATTACHMENT_BYTES', 25 * 1024 * 1024);
+  },
+  get inboxMaxTotalAttachmentBytes(): number {
+    return positiveSafeIntegerEnv('INBOX_MAX_TOTAL_ATTACHMENT_BYTES', 50 * 1024 * 1024);
+  },
+  get inboxMaxUrls(): number {
+    return positiveSafeIntegerEnv('INBOX_MAX_URLS', 10);
   },
   /** New captures wait for a human review before durable KB promotion by default. */
   get requireReview(): boolean {
