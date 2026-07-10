@@ -121,6 +121,14 @@ point for any production archive change.
 ## Start checklist
 
 1. Install Node 22.12+, ffmpeg, Parakeet MLX, Ollama, and optionally yt-dlp.
+   Known issue (2026-07-09): the first-run Parakeet model download from
+   Hugging Face is flaky when anonymous — the `hf_xet` backend can stall at
+   zero bytes/sec, and the plain-HTTPS fallback (`HF_HUB_DISABLE_XET=1`) has
+   hit read timeouts near the end of `model.safetensors` with no resumable
+   state. Set `HF_TOKEN` (free account) plus `HF_HUB_DISABLE_XET=1`, budget
+   10–15 minutes, and confirm the cache directory is still growing before
+   concluding a stall:
+   `du -sh ~/.cache/huggingface/hub/models--mlx-community--parakeet-tdt-0.6b-v3`
 2. Run `npm ci`.
 3. Ensure `.env` is owner-only (`chmod 600 .env`), then compare it with
    `.env.example`; do not assume an old config is authorized. Complete
