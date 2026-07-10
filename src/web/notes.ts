@@ -3,9 +3,10 @@
 // checks, because :file comes straight from an untrusted URL.
 
 import { existsSync, realpathSync } from 'node:fs';
-import { readFile, readdir } from 'node:fs/promises';
+import { readFile, readdir, stat } from 'node:fs/promises';
 import path from 'node:path';
 import { config } from '../config.js';
+import { normalizeWorkspaceId, workspaceRoot } from '../kb.js';
 import { parseFrontmatter } from './markdown.js';
 
 export interface NoteSummary {
@@ -14,10 +15,13 @@ export interface NoteSummary {
   title: string;
   description: string;
   type: string;
+  updatedAt: string;
 }
 
 export interface PalaceMap {
   topics: NoteSummary[];
+  records: NoteSummary[];
+  /** Compatibility alias for the v1 reading-room API. */
   meetings: NoteSummary[];
 }
 
@@ -26,7 +30,8 @@ function titleOf(content: string, fallback: string): string {
 }
 
 async function summarize(file: string): Promise<NoteSummary> {
-  const content = await readFile(path.join(config.kbDir, file), 'utf8');
+  const absolute = path.join(config.kbDir, file);
+  const [content, info] = await Promise.all([readFile(absolute, 'utf8'), stat(absolute)]);
   const { meta } = parseFrontmatter(content);
   const base = path.basename(file).replace(/\.md$/, '');
   return {
@@ -35,6 +40,7 @@ async function summarize(file: string): Promise<NoteSummary> {
     title: titleOf(content, meta.name ?? base),
     description: meta.description ?? '',
     type: meta.type ?? '',
+    updatedAt: info.mtime.toISOString(),
   };
 }
 
@@ -42,13 +48,48 @@ async function listDir(sub: string): Promise<NoteSummary[]> {
   const dir = path.join(config.kbDir, sub);
   if (!existsSync(dir)) return [];
   const files = (await readdir(dir)).filter((f) => f.endsWith('.md')).sort();
-  return Promise.all(files.map((f) => summarize(`${sub}/${f}`)));
+  return Promise.all(files.map((f) => summarize(path.posix.join(sub, f))));
 }
 
-/** The palace map: durable topics and the meeting record, newest meetings first. */
-export async function buildPalaceMap(): Promise<PalaceMap> {
-  const [topics, meetings] = await Promise.all([listDir('topics'), listDir('meetings')]);
-  return { topics, meetings: meetings.reverse() };
+function validWorkspaceSegment(workspaceId: string): string {
+  try {
+    return normalizeWorkspaceId(workspaceId);
+  } catch (error) {
+    throw new NoteAccessError(error instanceof Error ? error.message : 'Invalid workspace', 400);
+  }
+}
+
+function uniqueNotes(notes: NoteSummary[]): NoteSummary[] {
+  const seen = new Set<string>();
+  return notes.filter((note) => {
+    if (seen.has(note.file)) return false;
+    seen.add(note.file);
+    return true;
+  });
+}
+
+/**
+ * The archive map. V2 workspace-scoped records are preferred, while v1
+ * meetings and root topics remain readable during migration.
+ */
+export async function buildPalaceMap(workspaceId = 'default'): Promise<PalaceMap> {
+  const workspace = validWorkspaceSegment(workspaceId);
+  const root = workspaceRoot(workspace);
+  const relativeRoot = path.relative(config.kbDir, root).split(path.sep).join('/');
+  const scoped = (sub: string) => relativeRoot ? path.posix.join(relativeRoot, sub) : sub;
+  const [topics, records, meetings] = await Promise.all([
+    listDir(scoped('topics')),
+    listDir(scoped('records')),
+    listDir(scoped('meetings')),
+  ]);
+
+  const sortedTopics = uniqueNotes(topics).sort((a, b) =>
+    a.title.localeCompare(b.title),
+  );
+  const approvedRecords = uniqueNotes([...records, ...meetings]).sort((a, b) =>
+    b.updatedAt.localeCompare(a.updatedAt),
+  );
+  return { topics: sortedTopics, records: approvedRecords, meetings: approvedRecords };
 }
 
 export class NoteAccessError extends Error {
@@ -108,9 +149,62 @@ export interface NoteContent {
   markdown: string;
 }
 
-/** Read one note by kb-relative path. Throws NoteAccessError with an HTTP status on any breach. */
-export async function readNote(relPath: string): Promise<NoteContent> {
-  const abs = safeResolve(relPath);
+export interface ReadNoteOptions {
+  workspaceId?: string;
+  /** Workspace-relative transcript paths attached to review drafts. */
+  allowedRawPaths?: readonly string[];
+}
+
+function relativeToWorkspace(absolute: string, workspaceId: string): string {
+  let root: string;
+  try {
+    root = realpathSync(workspaceRoot(workspaceId));
+  } catch {
+    throw new NoteAccessError('Workspace not found', 404);
+  }
+  const file = realpathSync(absolute);
+  const relative = path.relative(root, file);
+  if (!relative || relative.startsWith('..') || path.isAbsolute(relative)) {
+    throw new NoteAccessError('Note belongs to a different workspace', 403);
+  }
+  return relative.split(path.sep).join('/');
+}
+
+function workspaceRequestPath(relPath: string, workspaceId: string): string {
+  const clean = relPath.replace(/^\/+/, '').split(path.sep).join('/');
+  if (workspaceId === 'default' || !/^(?:meetings|records|topics|transcripts)\//.test(clean)) {
+    return clean;
+  }
+  const workspacePrefix = path.relative(config.kbDir, workspaceRoot(workspaceId)).split(path.sep).join('/');
+  return path.posix.join(workspacePrefix, clean);
+}
+
+function workspaceRawPath(rawPath: string, workspaceId: string): string {
+  const clean = rawPath.replace(/^\/+/, '').split(path.sep).join('/');
+  const workspacePrefix = path.relative(config.kbDir, workspaceRoot(workspaceId)).split(path.sep).join('/');
+  return workspacePrefix && clean.startsWith(`${workspacePrefix}/`)
+    ? clean.slice(workspacePrefix.length + 1)
+    : clean;
+}
+
+/**
+ * Read one approved note in the requested workspace, or a raw capture that is
+ * explicitly attached to one of that workspace's review drafts.
+ */
+export async function readNote(relPath: string, options: ReadNoteOptions = {}): Promise<NoteContent> {
+  const workspaceId = validWorkspaceSegment(options.workspaceId ?? 'default');
+  const requested = workspaceRequestPath(relPath, workspaceId);
+  const abs = safeResolve(requested);
+  const workspaceRelative = relativeToWorkspace(abs, workspaceId);
+  const topLevel = workspaceRelative.split('/')[0];
+  const approved = topLevel === 'meetings' || topLevel === 'records' || topLevel === 'topics';
+  const allowedRaw = new Set(
+    (options.allowedRawPaths ?? []).map((rawPath) => workspaceRawPath(rawPath, workspaceId)),
+  );
+  if (!approved && !(topLevel === 'transcripts' && allowedRaw.has(workspaceRelative))) {
+    throw new NoteAccessError('Note is not available in this workspace', 403);
+  }
+
   const markdown = await readFile(abs, 'utf8');
   const { meta } = parseFrontmatter(markdown);
   const rel = path.relative(config.kbDir, abs);

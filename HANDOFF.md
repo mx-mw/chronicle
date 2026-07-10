@@ -1,96 +1,213 @@
-# Handoff
+# Chronicle v2 handoff
 
-Status as of this session: Chronicle runs fully offline (no cloud API calls) and
-the Discord side is fully configured and ready to go. The transcription
-question left open by the previous session is now resolved — see "Resolved"
-below. Discord itself is still untested end-to-end.
+Status date: 2026-07-10
 
-## What's done
+## Decision
 
-- **Distillation** switched from the Anthropic API to any local
-  OpenAI-compatible server (`src/summarize.ts` calls `POST {LLM_BASE_URL}/chat/completions`).
-  Configured against Ollama, model `qwen2.5:3b`.
-  - `qwen3:4b` was tried first and rejected: it's a reasoning model and burned
-    5,134 tokens of hidden chain-of-thought before writing JSON, taking 159s
-    for a 4-line test transcript. `qwen2.5:3b` did the same task in 30s with
-    comparable output quality. If you swap models, avoid "thinking" models
-    for this step unless you don't mind the latency.
-  - Verified end-to-end: real `summarizeMeeting()` call against real Ollama,
-    valid structured JSON out.
+Chronicle did not need to be discarded and regenerated as a new framework app.
+Its strongest choices were already correct: local processing, speaker-separated
+Discord audio, portable Markdown, and a small dependency surface.
 
-- **Transcription** switched from whisper.cpp to Parakeet MLX
-  (`src/transcribe.ts`, `uv tool install parakeet-mlx`, model
-  `mlx-community/parakeet-tdt-0.6b-v3`, runs on Apple Silicon GPU via MLX).
-  whisper.cpp's `WHISPER_*` env vars, `scripts/download-model.sh`, and the
-  `npm run setup:whisper` script are gone. Old `models/ggml-base.en.bin` may
-  still be sitting on disk (gitignored) — safe to delete, it's unused now.
+The right intervention was a deep seam-level rebuild. The capture runtime,
+authorization, durable processing, review boundary, knowledge writes, indexing,
+retrieval, web workflow, diagnostics, and release gates have been replaced or
+hardened while preserving the original archive and product identity.
 
-- **Discord**: `.env` has a live `DISCORD_TOKEN` and `GUILD_ID` already
-  filled in (not committed — gitignored). Bot is invited via OAuth2 URL
-  (scopes `bot` + `applications.commands`; perms View Channels / Send
-  Messages / Connect).
+## Current product
 
-## Resolved
+Chronicle now supports the complete working loop:
 
-**Parakeet transcription accuracy: confirmed good.** Word-perfect on the macOS
-`say` test, ~5s for a 10s clip once the model is cached. The `HF_HUB_DISABLE_XET=1`
-workaround for the stalled first-run download works and is now in the README.
-
-**But it needed an MLX pin.** On an M5 / macOS 26.1, `mlx==0.32.0` cannot compile
-its Metal GPU kernels — every transcription dies with `unsupported
-deferred-static-alloca-size` inside `mpp::tensor_ops::__matmul2d` (MLX's new
-tensor-core GEMM path). 0.32.0 is the latest release, so there is nothing to
-upgrade to; pin backwards instead:
-
-```sh
-uv tool install --force parakeet-mlx --with "mlx==0.31.2"
+```text
+capture -> preserve raw source -> extract draft -> review -> approve
+        -> update records/topics -> index -> retrieve -> cited answer
 ```
 
-Worth re-testing on the next MLX release — this is an upstream bug, not ours.
+The web app exposes Capture, Inbox, Records, Topics, Ask/Find, Digest, and Trust.
+Discord recording has consent grace, opt-out, discard, recovery, retention, and
+guild-scoped recall. CLI workflows cover the same archive without requiring the
+web UI.
 
-**A real bug fell out of that.** `parakeet-mlx` catches per-file errors
-internally, prints "transcription complete", writes no output file, and still
-**exits 0**. `transcribeWav()` only threw on a nonzero exit, so a totally broken
-ASR backend was swallowed segment-by-segment and reported to the user as *"No
-usable speech was captured"* — blaming them for a toolchain failure while
-silently discarding a real meeting. Fixed: the output file's existence is now
-the success signal, and `transcribeSession()` throws a `TranscriptionError` when
-every attempted segment fails, instead of returning an empty transcript. The
-error names the Metal failure and prints the pin command.
+## What changed
 
-**Pipeline verified end-to-end** (audio → Parakeet → Ollama → `kb/`) via
-`npm run ingest` on a synthetic meeting: 14.7s total, correct decisions, owned
-action items, and open questions extracted. Both the success and failure paths
-were tested (the latter with a stub binary that mimics the exit-0-write-nothing
-behaviour).
+### Trust and runtime
 
-## Still needs verification
+- Auto-record is off by default.
+- Record and recall have independent deny-by-default guild, channel, user, and
+  role policies.
+- The public consent notice must succeed before a grace period and capture.
+- Initial and late-participant notices disclose local processing or any
+  configured off-machine model boundary before admission.
+- Before recording stops, `/record optout` erases a participant's audio;
+  `/record discard` cancels a pending, active, or queued capture.
+- Stable UUID session manifests preserve recoverable state across restarts.
+- A bounded single-worker queue adds retry, stage timeout, cancellation, and
+  graceful shutdown behavior.
+- Raw audio plus temporary ASR artifacts are retention-swept at startup and
+  after processing.
+- Forgotten or adversarial captures stop automatically at configured duration,
+  aggregate decoded-byte, free-disk-reserve, or segment-count limits; prior
+  audio continues through the normal review/filing policy.
+- Overlapping captures remain individually addressable through the session IDs
+  shown by `/record status` and `/record discard session:<id>`.
 
-A real end-to-end test through Discord itself (`/record start` → talk →
-`/record stop`). Everything up to the bot boundary is now exercised, but the
-voice-receive path has still only been tested via `npm run ingest`, not a live
-call.
+### Knowledge integrity
 
-## Architecture notes
+- Committed capture and ingest flows durably write raw source text before model
+  inference. No-write previews intentionally do not persist it.
+- New model output is a versioned `needs_review` record by default.
+- Approval is idempotent and is the only path into approved records and topics.
+- Names are Unicode-safe and collision-resistant; frontmatter values are
+  YAML-safe; file writes use atomic rename and cross-process locking.
+- Source hashes and stable record IDs support duplicate and retry safety.
+- Existing topic names are supplied to extraction so the archive does not
+  fragment into near-duplicate topics.
+- Long sources use section-aware chunks and a deterministic merge rather than
+  truncating the tail.
+- Source text and retrieved excerpts are treated as untrusted data in prompts.
 
-- `transcribeWav()` in `src/transcribe.ts` shells out to `parakeet-mlx` once
-  per audio segment (one Discord utterance = one segment), same pattern
-  whisper.cpp used. Each invocation reloads the model, which is wasteful —
-  `parakeet-mlx` actually accepts multiple file args in one invocation
-  (`parakeet-mlx file1.wav file2.wav ...`), so batching all of a session's
-  segments into a single call would avoid N model loads. Not done here to
-  keep the whisper→Parakeet swap a straight substitution; worth doing if
-  transcription latency turns out to matter in practice.
-- `summarizeMeeting()` reads `data.choices[0].message.content` from the
-  OpenAI-compat response and deliberately ignores `.reasoning` — that's what
-  makes it safe to point at a reasoning model later without code changes,
-  just accept the latency cost.
+### Retrieval
 
-## Config reference (`.env`)
+- The derived SQLite index is versioned and transactional.
+- Workspace, embedding model, vector dimension, schema, and chunker metadata are
+  checked before search.
+- Keyword retrieval remains usable without an embedding service.
+- Vector hits below the evidence floor are excluded.
+- Recall validates citations against retrieved sources and returns
+  `INSUFFICIENT_EVIDENCE` when it cannot ground an answer.
 
-| Var | Purpose |
-| --- | --- |
-| `DISCORD_TOKEN` / `GUILD_ID` | already filled in |
-| `LLM_BASE_URL`, `CHRONICLE_MODEL`, `LLM_API_KEY` | distillation backend |
-| `PARAKEET_BIN`, `PARAKEET_MODEL` | transcription backend |
-| `KB_DIR`, `SESSIONS_DIR` | output locations |
+### Web product
+
+- The old single reading page is now a full review and archive workflow without
+  adding a frontend framework.
+- The app has explicit loading, empty, partial, error, recovery, dark-mode,
+  reduced-motion, keyboard, and mobile states.
+- Review mutations use optimistic revision checks.
+- Capture uses a short-lived bounded server-side preview cache; raw text is not
+  returned to the browser or logged.
+- The server validates Host headers, emits security headers, defaults to
+  loopback, and requires Bearer or Basic-token auth for remote binding.
+- Production builds copy the static assets and run a compiled-server smoke test.
+
+### Operations
+
+- `doctor`, `review`, `digest`, and `maintain` CLIs were added.
+- Ingest supports batches, attribution, kinds, workspaces, no-write previews,
+  explicit direct approval, and JSON output.
+- External commands, HTTP requests, models, source sizes, and media durations
+  are bounded.
+- Parakeet processes a session batch instead of reloading the model once per
+  segment and distinguishes silence from backend failure.
+- CI runs the full check on Node 22.12 and Node 24.
+- `undici` is a pinned direct dependency for DNS-pinned article fetches;
+  `npm audit` is clean.
+
+## Compatibility and data
+
+No destructive migration is required.
+
+- The default workspace still uses `kb/meetings`, `kb/topics`,
+  `kb/transcripts`, and `kb/INDEX.md`.
+- Existing approved Markdown remains readable and indexable.
+- Additional workspaces use `kb/workspaces/<workspace-key>`.
+- Review state and the operational ledger live below `kb/.chronicle`.
+- `kb/.index.db` is derived. Run `npm run index -- --force` whenever a clean
+  rebuild is preferred.
+- Session manifests live beside temporary PCM under `sessions/`.
+
+Make a normal filesystem backup of `kb/` before the first live v2 session. The
+implementation is backward-compatible, but that backup is the safest rollback
+point for any production archive change.
+
+## Start checklist
+
+1. Install Node 22.12+, ffmpeg, Parakeet MLX, Ollama, and optionally yt-dlp.
+2. Run `npm ci`.
+3. Ensure `.env` is owner-only (`chmod 600 .env`), then compare it with
+   `.env.example`; do not assume an old config is authorized. Complete
+   allowlists are now required. Set `WORKSPACE_ID` and
+   `WEB_WORKSPACE_ID` to the Discord guild ID so CLI review and the web Inbox
+   open the workspace where Discord writes its drafts.
+4. Keep `AUTO_RECORD=false` for the first validation call.
+5. Run `npm run index -- --force` for the existing approved archive.
+6. Run `npm run doctor` and resolve every failure.
+7. Start `npm run web` and inspect Inbox and Trust. Confirm the Inbox is using
+   the Discord guild workspace before the live test.
+8. Start `npm run dev` and perform the private Discord smoke test below.
+
+## Live smoke test still required
+
+The repository test suite does not send Discord messages or capture external
+audio. In one private allowlisted channel:
+
+1. Run `/record start` and confirm the notice is visible before the bot joins.
+2. Before recording stops, test `/record optout` once and confirm that speaker
+   is absent from capture. After stop, use the authorized whole-capture
+   `/record discard` command if queued material must be removed.
+3. Have another participant join after recording is active. Confirm their audio
+   is suppressed until their personal notice and grace period complete.
+4. Record a short two-speaker exchange, then run `/record stop`.
+5. Restart once after stop to confirm manifest recovery does not duplicate the
+   draft.
+6. Open Inbox, compare the source transcript and extraction, edit one field,
+   approve, and confirm the record appears in Records and search.
+7. Ask one supported and one unsupported `/recall` question. Confirm the first
+   cites evidence and the second abstains.
+8. Test `/record discard` on a second short capture and confirm PCM is erased.
+
+This test needs explicit human consent and a real Discord server, so it has not
+been automated or performed during the code audit.
+
+## Recommended next enrichments
+
+1. Add an operator-facing raw-source lifecycle: per-record archive/delete,
+   configurable raw-text retention, and a dry-run retention report. Audio has a
+   sweeper today; raw transcripts deliberately do not.
+2. Add a web workspace switcher for teams using more than one Discord guild.
+   The current browser workspace is explicit and safe, but configured at
+   startup rather than switched in the interface.
+3. Add a transcript timeline with speaker correction and optional retained-audio
+   playback inside Inbox. Keep it review-only and preserve every edit as a
+   revision.
+4. Add a small retrieval evaluation set: known-answer questions, expected
+   citations, and abstention cases. Run it when changing models, chunking, or
+   relevance thresholds.
+5. Add opt-in action export only after review (for example, tasks or calendar),
+   with a visible confirmation queue and idempotency keys. Chronicle should not
+   turn extracted model output into external actions automatically.
+6. If Chronicle moves beyond one trusted Mac, add at-rest encryption and OS
+   keychain-backed secrets before expanding remote access.
+
+## Known limitations
+
+- If `/record discard` arrives after raw text has already been persisted into
+  the review inbox, processing is cancelled and PCM is erased, but that durable
+  text is retained indefinitely unless an operator explicitly removes or
+  archives it. Chronicle does not currently have an automatic raw-text
+  retention sweeper, and the bot reports this boundary rather than claiming
+  deletion that did not occur.
+- Capture preview has been exercised with synthetic UI data, not a live model
+  and every extractor combination.
+- Node 22 prints an experimental warning for the built-in SQLite module. The
+  tested API is available and CI covers Node 22.12 and Node 24.
+- The project has no declared open-source license. Add one only after Ethan and
+  Max choose the intended ownership and distribution terms.
+
+## Verification completed
+
+- Strict TypeScript typecheck
+- Full Node test suite, including web security and trust workflow tests
+- Production build and static-asset copy
+- Compiled web server smoke test
+- Desktop and mobile screenshot review in light and dark modes
+- Bearer, Basic, unauthenticated, and malformed-Host web checks
+- `git diff --check`
+- `npm audit --audit-level=moderate` with zero vulnerabilities
+
+Run the complete local gate with:
+
+```sh
+npm run check
+```
+
+See `README.md` for operator documentation, `ARCHITECTURE.md` for persistence and
+state contracts, and `DESIGN.md` for the interface contract.

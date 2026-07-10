@@ -4,7 +4,7 @@ import path from 'node:path';
 import { extractUrl } from './url.js';
 import { extractPdf } from './pdf.js';
 import { extractText as extractTextFile } from './text.js';
-import { extractYoutube } from './youtube.js';
+import { canonicalizeYoutubeVideoUrl, extractYoutube } from './youtube.js';
 import { extractAudio } from './audio.js';
 
 export type SourceKind = 'meeting' | 'article' | 'pdf' | 'video' | 'text';
@@ -42,15 +42,6 @@ function isHttpUrl(input: string): boolean {
   return /^https?:\/\//i.test(input);
 }
 
-function isYoutube(url: string): boolean {
-  try {
-    const host = new URL(url).hostname.replace(/^www\./, '').toLowerCase();
-    return host === 'youtube.com' || host === 'm.youtube.com' || host === 'youtu.be';
-  } catch {
-    return false;
-  }
-}
-
 /**
  * Dispatch on the shape of `input`: a URL is fetched (YouTube specially), a
  * path is read according to its extension. The returned kind is the natural
@@ -60,7 +51,10 @@ export async function extract(input: string, opts: ExtractOptions = {}): Promise
   let result: ExtractedSource;
 
   if (isHttpUrl(input)) {
-    result = isYoutube(input) ? await extractYoutube(input, opts) : await extractUrl(input, opts);
+    const canonicalYoutubeUrl = canonicalizeYoutubeVideoUrl(input);
+    result = canonicalYoutubeUrl
+      ? await extractYoutube(canonicalYoutubeUrl, opts)
+      : await extractUrl(input, opts);
   } else {
     const ext = path.extname(input).toLowerCase();
     if (ext === '.pdf') {

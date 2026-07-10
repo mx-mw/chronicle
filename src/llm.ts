@@ -1,128 +1,171 @@
-/**
- * One interface, two backends: a local OpenAI-compatible server (Ollama,
- * llama.cpp) and Claude via Anthropic's Messages API.
- *
- * These are not the same shape and cannot be unified by swapping a base URL.
- * Anthropic's API is `POST /v1/messages` — `system` is a top-level parameter
- * rather than a message, and it enforces a JSON schema server-side instead of
- * being asked nicely in the prompt. So each backend gets a real adapter, and
- * `completeJson()` is the seam the rest of Chronicle codes against.
- */
+/** LLM adapters for local OpenAI-compatible servers and Anthropic. */
 import Anthropic from '@anthropic-ai/sdk';
 import { config } from './config.js';
+import {
+  assertModelEndpointAllowed,
+  booleanEnv,
+  fetchWithTimeout,
+  positiveIntegerEnv,
+  withTimeout,
+} from './runtime.js';
 
 export interface JsonRequest {
   system: string;
   user: string;
-  /** JSON Schema the response must satisfy. Enforced by the API on Claude. */
   schema: Record<string, unknown>;
   maxTokens?: number;
 }
 
-/**
- * Pull a JSON object out of prose. Only needed for local models, which are
- * asked for JSON and mostly comply — sometimes wrapped in a code fence, or
- * trailed by a cheerful sentence. Claude's structured outputs make this
- * unnecessary, which is the point of having a schema at all.
- */
 export function extractJson(text: string): unknown {
   const trimmed = text.trim();
   const fenced = trimmed.match(/```(?:json)?\s*([\s\S]*?)```/);
   const candidate = fenced ? fenced[1] : trimmed;
   const start = candidate.indexOf('{');
   const end = candidate.lastIndexOf('}');
-  if (start === -1 || end === -1) throw new Error('No JSON object in model response');
+  if (start === -1 || end === -1) throw new Error('No JSON object in model response.');
   return JSON.parse(candidate.slice(start, end + 1));
 }
 
-async function completeJsonLocal(req: JsonRequest): Promise<unknown> {
-  const res = await fetch(`${config.llmBaseUrl}/chat/completions`, {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      ...(config.llmApiKey ? { Authorization: `Bearer ${config.llmApiKey}` } : {}),
-    },
-    body: JSON.stringify({
-      model: config.llmModel,
-      max_tokens: req.maxTokens ?? 8_000,
-      messages: [
-        { role: 'system', content: req.system },
-        { role: 'user', content: req.user },
-      ],
-    }),
-  });
-
-  if (!res.ok) {
-    throw new Error(
-      `Local LLM request failed (${res.status} ${res.statusText}): ${await res.text()}. ` +
-        `Is a server running at ${config.llmBaseUrl}? For Ollama: \`ollama serve\`.`,
-    );
-  }
-
-  // Deliberately ignore `.reasoning` — that keeps reasoning models working
-  // here without code changes, at the cost of their latency.
-  const data = (await res.json()) as { choices: { message: { content: string } }[] };
-  return extractJson(data.choices[0]?.message.content ?? '');
+function schemaType(schema: Record<string, unknown>): string | undefined {
+  return typeof schema.type === 'string' ? schema.type : undefined;
 }
 
-async function completeJsonAnthropic(req: JsonRequest): Promise<unknown> {
-  const client = new Anthropic({ apiKey: config.anthropicApiKey });
-
-  const response = await client.messages.create({
-    model: config.anthropicModel,
-    max_tokens: req.maxTokens ?? 8_000,
-    thinking: { type: 'adaptive' },
-    system: req.system,
-    messages: [{ role: 'user', content: req.user }],
-    output_config: { format: { type: 'json_schema', schema: req.schema } },
-  });
-
-  if (response.stop_reason === 'refusal') {
-    throw new Error('Claude declined to process this transcript.');
+/** Dependency-free validation for the JSON-schema subset Chronicle emits. */
+export function validateJsonSchema(
+  value: unknown,
+  schema: Record<string, unknown>,
+  path = '$',
+): void {
+  const type = schemaType(schema);
+  if (type === 'object') {
+    if (typeof value !== 'object' || value === null || Array.isArray(value)) {
+      throw new Error(`${path} must be an object.`);
+    }
+    const record = value as Record<string, unknown>;
+    const properties = (schema.properties ?? {}) as Record<string, Record<string, unknown>>;
+    const required = Array.isArray(schema.required) ? (schema.required as string[]) : [];
+    for (const key of required) {
+      if (!(key in record)) throw new Error(`${path}.${key} is required.`);
+    }
+    if (schema.additionalProperties === false) {
+      for (const key of Object.keys(record)) {
+        if (!(key in properties)) throw new Error(`${path}.${key} is not allowed.`);
+      }
+    }
+    for (const [key, childSchema] of Object.entries(properties)) {
+      if (key in record) validateJsonSchema(record[key], childSchema, `${path}.${key}`);
+    }
+    return;
   }
-  if (response.stop_reason === 'max_tokens') {
+  if (type === 'array') {
+    if (!Array.isArray(value)) throw new Error(`${path} must be an array.`);
+    const items = schema.items as Record<string, unknown> | undefined;
+    if (items) value.forEach((item, index) => validateJsonSchema(item, items, `${path}[${index}]`));
+    return;
+  }
+  if (type === 'string' && typeof value !== 'string') throw new Error(`${path} must be a string.`);
+  if (type === 'number' && typeof value !== 'number') throw new Error(`${path} must be a number.`);
+  if (type === 'integer' && (typeof value !== 'number' || !Number.isInteger(value))) {
+    throw new Error(`${path} must be an integer.`);
+  }
+  if (type === 'boolean' && typeof value !== 'boolean') throw new Error(`${path} must be a boolean.`);
+  if (Array.isArray(schema.enum) && !schema.enum.includes(value)) {
+    throw new Error(`${path} must be one of ${schema.enum.join(', ')}.`);
+  }
+}
+
+function localTimeout(): number {
+  return positiveIntegerEnv('LLM_TIMEOUT_MS', positiveIntegerEnv('PROCESSING_TIMEOUT_MS', 30 * 60_000));
+}
+
+async function completeJsonLocal(request: JsonRequest): Promise<unknown> {
+  assertModelEndpointAllowed(config.llmBaseUrl, 'LLM_BASE_URL');
+  const response = await fetchWithTimeout(
+    `${config.llmBaseUrl.replace(/\/+$/, '')}/chat/completions`,
+    {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        ...(config.llmApiKey ? { Authorization: `Bearer ${config.llmApiKey}` } : {}),
+      },
+      body: JSON.stringify({
+        model: config.llmModel,
+        max_tokens: request.maxTokens ?? 8_000,
+        ...(booleanEnv('LLM_JSON_MODE', true) ? { response_format: { type: 'json_object' } } : {}),
+        messages: [
+          { role: 'system', content: request.system },
+          { role: 'user', content: request.user },
+        ],
+      }),
+    },
+    localTimeout(),
+  );
+  if (!response.ok) {
     throw new Error(
-      `Claude hit the ${req.maxTokens ?? 8_000}-token output cap before finishing the JSON. ` +
-        `Raise maxTokens, or distil a shorter transcript.`,
+      `Local LLM request failed (${response.status} ${response.statusText}): ${await response.text()}. ` +
+        `Confirm that ${config.llmModel} is available.`,
     );
   }
+  const data = (await response.json()) as { choices?: { message?: { content?: string } }[] };
+  const parsed = extractJson(data.choices?.[0]?.message?.content ?? '');
+  validateJsonSchema(parsed, request.schema);
+  return parsed;
+}
 
+async function completeJsonAnthropic(request: JsonRequest): Promise<unknown> {
+  const client = new Anthropic({ apiKey: config.anthropicApiKey });
+  const response = await withTimeout(
+    client.messages.create({
+      model: config.anthropicModel,
+      max_tokens: request.maxTokens ?? 8_000,
+      thinking: { type: 'adaptive' },
+      system: request.system,
+      messages: [{ role: 'user', content: request.user }],
+      output_config: { format: { type: 'json_schema', schema: request.schema } },
+    }),
+    positiveIntegerEnv('ANTHROPIC_TIMEOUT_MS', 30 * 60_000),
+    'Anthropic JSON request',
+  );
+  if (response.stop_reason === 'refusal') throw new Error('Claude declined to process this source.');
+  if (response.stop_reason === 'max_tokens') {
+    throw new Error(`Claude reached the ${request.maxTokens ?? 8_000}-token output limit.`);
+  }
   const text = response.content
     .filter((block): block is Anthropic.TextBlock => block.type === 'text')
     .map((block) => block.text)
     .join('');
-
-  // The schema is enforced server-side, so this is a plain parse, not a rescue.
-  return JSON.parse(text);
+  const parsed = JSON.parse(text);
+  validateJsonSchema(parsed, request.schema);
+  return parsed;
 }
 
-/** Ask the configured model for a JSON object matching `schema`. */
-export async function completeJson(req: JsonRequest): Promise<unknown> {
+export async function completeJson(request: JsonRequest): Promise<unknown> {
   return config.llmProvider === 'anthropic'
-    ? completeJsonAnthropic(req)
-    : completeJsonLocal(req);
+    ? completeJsonAnthropic(request)
+    : completeJsonLocal(request);
 }
 
-/** Ask the configured model for prose. Used by `/recall` to answer over the KB. */
-export async function completeText(req: {
+export async function completeText(request: {
   system: string;
   user: string;
   maxTokens?: number;
 }): Promise<string> {
-  const maxTokens = req.maxTokens ?? 2_000;
-
+  const maxTokens = request.maxTokens ?? 2_000;
   if (config.llmProvider === 'anthropic') {
     const client = new Anthropic({ apiKey: config.anthropicApiKey });
-    const response = await client.messages.create({
-      model: config.anthropicModel,
-      max_tokens: maxTokens,
-      thinking: { type: 'adaptive' },
-      system: req.system,
-      messages: [{ role: 'user', content: req.user }],
-    });
-    if (response.stop_reason === 'refusal') {
-      throw new Error('Claude declined to answer this question.');
-    }
+    const response = await withTimeout(
+      client.messages.create({
+        model: config.anthropicModel,
+        max_tokens: maxTokens,
+        thinking: { type: 'adaptive' },
+        system: request.system,
+        messages: [{ role: 'user', content: request.user }],
+      }),
+      positiveIntegerEnv('ANTHROPIC_TIMEOUT_MS', 30 * 60_000),
+      'Anthropic text request',
+    );
+    if (response.stop_reason === 'refusal') throw new Error('Claude declined to answer this question.');
+    if (response.stop_reason === 'max_tokens') throw new Error('Claude reached the answer token limit.');
     return response.content
       .filter((block): block is Anthropic.TextBlock => block.type === 'text')
       .map((block) => block.text)
@@ -130,31 +173,35 @@ export async function completeText(req: {
       .trim();
   }
 
-  const res = await fetch(`${config.llmBaseUrl}/chat/completions`, {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      ...(config.llmApiKey ? { Authorization: `Bearer ${config.llmApiKey}` } : {}),
+  assertModelEndpointAllowed(config.llmBaseUrl, 'LLM_BASE_URL');
+  const response = await fetchWithTimeout(
+    `${config.llmBaseUrl.replace(/\/+$/, '')}/chat/completions`,
+    {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        ...(config.llmApiKey ? { Authorization: `Bearer ${config.llmApiKey}` } : {}),
+      },
+      body: JSON.stringify({
+        model: config.llmModel,
+        max_tokens: maxTokens,
+        messages: [
+          { role: 'system', content: request.system },
+          { role: 'user', content: request.user },
+        ],
+      }),
     },
-    body: JSON.stringify({
-      model: config.llmModel,
-      max_tokens: maxTokens,
-      messages: [
-        { role: 'system', content: req.system },
-        { role: 'user', content: req.user },
-      ],
-    }),
-  });
-  if (!res.ok) {
-    throw new Error(`Local LLM request failed (${res.status}): ${await res.text()}`);
+    localTimeout(),
+  );
+  if (!response.ok) {
+    throw new Error(`Local LLM request failed (${response.status}): ${await response.text()}`);
   }
-  const data = (await res.json()) as { choices: { message: { content: string } }[] };
-  return (data.choices[0]?.message.content ?? '').trim();
+  const data = (await response.json()) as { choices?: { message?: { content?: string } }[] };
+  return (data.choices?.[0]?.message?.content ?? '').trim();
 }
 
-/** Human-readable description of the active backend, for startup logs. */
 export function describeProvider(): string {
   return config.llmProvider === 'anthropic'
     ? `Claude (${config.anthropicModel})`
-    : `local (${config.llmModel} at ${config.llmBaseUrl})`;
+    : `local (${config.llmModel})`;
 }

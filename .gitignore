@@ -1,7 +1,12 @@
 node_modules/
 dist/
+coverage/
+test-results/
+*.log
+.DS_Store
 .env
 sessions/
 models/
 kb/
 .claude/
+.codex/
