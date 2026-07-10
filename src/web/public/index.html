@@ -8,8 +8,10 @@
       content="Review captured knowledge, read approved records, and recall decisions with evidence."
     />
     <meta name="color-scheme" content="light dark" />
-    <title>Chronicle | Working archive</title>
+    <title>Chronicle | Living memory</title>
+    <script src="/theme-init.js"></script>
     <link rel="stylesheet" href="/styles.css" />
+    <link rel="stylesheet" href="/organic.css" />
     <script src="/app.js" defer></script>
   </head>
   <body>
@@ -28,15 +30,26 @@
             Menu
           </button>
 
-          <a class="wordmark" href="#inbox" data-view-link="inbox" aria-label="Chronicle inbox">
+          <a class="wordmark" href="#home" data-view-link="home" aria-label="Chronicle home">
             <span class="wordmark-name">Chronicle</span>
-            <span class="wordmark-note">working archive</span>
+            <span class="wordmark-note">living memory</span>
           </a>
 
           <div class="masthead-actions">
+            <button class="search-button" id="search-button" type="button" data-command-link="find">
+              <span>Search memory</span>
+              <svg viewBox="0 0 24 24" aria-hidden="true">
+                <circle cx="11" cy="11" r="6.5"></circle>
+                <path d="m16 16 4 4"></path>
+              </svg>
+              <kbd>/</kbd>
+            </button>
+            <button class="button button-primary add-source-button" type="button" data-view-link="capture">
+              Add source
+            </button>
             <button class="health-button" id="health-button" type="button" data-view-link="trust">
               <span class="health-state" id="health-state">Checking</span>
-              <span class="health-detail" id="health-detail">Archive health</span>
+              <span class="health-detail" id="health-detail">System health</span>
             </button>
             <button class="theme-button" id="theme-button" type="button" aria-label="Change color theme">
               Theme: system
@@ -45,16 +58,23 @@
         </div>
       </header>
 
-      <section class="command-band" aria-labelledby="command-title">
+      <button class="command-backdrop" id="command-backdrop" type="button" aria-label="Close memory search" hidden></button>
+      <section class="command-band" id="command-panel" role="dialog" aria-modal="true" aria-labelledby="command-title" hidden>
         <div class="command-inner">
           <div class="command-heading">
-            <h2 id="command-title">Ask or find</h2>
+            <div>
+              <h2 id="command-title">Search memory</h2>
+              <p>Ask a question or find an exact phrase across approved records.</p>
+            </div>
+            <button class="button button-text command-close" type="button" data-dismiss-command>Close</button>
+          </div>
+          <div class="command-mode-row">
             <div class="mode-switch" role="group" aria-label="Command mode">
               <button class="mode-button is-active" type="button" data-command-mode="ask" aria-pressed="true">
-                Ask
+                Answer
               </button>
               <button class="mode-button" type="button" data-command-mode="find" aria-pressed="false">
-                Find
+                Exact matches
               </button>
             </div>
           </div>
@@ -70,7 +90,7 @@
                   placeholder="What did we decide about storage?"
                   aria-describedby="command-help command-error"
                 />
-                <button class="button button-primary" id="command-submit" type="submit">Ask</button>
+                <button class="button button-primary" id="command-submit" type="submit">Answer</button>
               </div>
               <p class="field-help" id="command-help">Answers cite retrieved excerpts. Chronicle abstains when evidence is weak.</p>
               <p class="field-error" id="command-error" hidden></p>
@@ -86,17 +106,17 @@
           <button class="drawer-close mobile-only" type="button" data-close-drawer>Close navigation</button>
           <button class="drawer-theme mobile-only" id="drawer-theme-button" type="button">Theme: system</button>
           <nav class="primary-navigation">
-            <button class="nav-item is-active" type="button" data-view-link="inbox" aria-current="page">
-              <span>Inbox</span>
+            <button class="nav-item is-active" type="button" data-view-link="home" aria-current="page">
+              <span>Home</span>
+            </button>
+            <button class="nav-item" type="button" data-view-link="inbox">
+              <span>Review</span>
               <span class="nav-count" id="inbox-count" aria-label="Loading inbox count">...</span>
             </button>
-            <button class="nav-item" type="button" data-view-link="capture"><span>Capture</span></button>
-            <button class="nav-item" type="button" data-view-link="records"><span>Records</span></button>
-            <button class="nav-item" type="button" data-view-link="topics"><span>Topics</span></button>
-            <button class="nav-item" type="button" data-command-link="ask"><span>Ask</span></button>
-            <button class="nav-item" type="button" data-command-link="find"><span>Find</span></button>
-            <button class="nav-item" type="button" data-view-link="digest"><span>Digest</span></button>
-            <button class="nav-item" type="button" data-view-link="trust"><span>Trust</span></button>
+            <button class="nav-item" type="button" data-view-link="library"><span>Library</span></button>
+          </nav>
+          <nav class="secondary-navigation" aria-label="System navigation">
+            <button class="nav-item" type="button" data-view-link="trust"><span>Settings</span></button>
           </nav>
           <div class="drawer-note">
             <strong>Memory boundary</strong>
@@ -112,6 +132,13 @@
           </section>
         </main>
       </div>
+
+      <nav class="mobile-tab-bar mobile-only" aria-label="Primary navigation">
+        <button type="button" data-view-link="home">Home</button>
+        <button type="button" data-view-link="inbox">Review</button>
+        <button type="button" data-view-link="library">Library</button>
+        <button type="button" data-view-link="capture">Add</button>
+      </nav>
     </div>
 
     <dialog class="confirm-dialog" id="reject-dialog" aria-labelledby="reject-title">
