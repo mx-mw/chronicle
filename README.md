@@ -467,5 +467,23 @@ The remaining environment-specific release gate is a live Discord smoke test in
 one private allowlisted channel. It is intentionally not automated because it
 sends a consent notice and captures external audio.
 
+### Discord change updates
+
+After both CI matrix jobs pass for a push to `main`, Chronicle can post a short
+change summary to a dedicated Discord updates channel. This uses a send-only
+webhook instead of exposing `DISCORD_TOKEN` to GitHub.
+
+1. Create a webhook in the Discord channel that should receive Chronicle
+   updates.
+2. In the GitHub repository, add an Actions secret named
+   `DISCORD_MAIN_UPDATES_WEBHOOK_URL` containing that webhook URL.
+3. Merge normally. The workflow posts the PR title, up to four bullets from its
+   `## Summary`, the PR link, and the checks that passed.
+
+The sender disables all mentions and accepts only official Discord webhook
+URLs. A successful commit-status marker prevents normal workflow reruns from
+posting the same SHA again. If the secret is absent, CI succeeds and skips the
+notification.
+
 Architecture decisions are recorded in [ARCHITECTURE.md](ARCHITECTURE.md), and
 the product's visual and interaction contract is in [DESIGN.md](DESIGN.md).
