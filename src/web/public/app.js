@@ -2,7 +2,7 @@
   'use strict';
 
   const state = {
-    view: 'inbox',
+    view: 'home',
     commandMode: 'ask',
     commandQuery: '',
     health: null,
@@ -26,7 +26,8 @@
     pendingRejectId: null,
     renderSequence: 0,
     lastDrawerFocus: null,
-    lastSafeHash: location.hash || '#inbox',
+    lastCommandFocus: null,
+    lastSafeHash: location.hash || '#home',
   };
 
   const elements = {
@@ -42,9 +43,11 @@
     healthDetail: document.getElementById('health-detail'),
     healthButton: document.getElementById('health-button'),
     inboxCount: document.getElementById('inbox-count'),
+    searchButton: document.getElementById('search-button'),
     menuButton: document.getElementById('menu-button'),
     drawer: document.getElementById('navigation-drawer'),
     backdrop: document.getElementById('drawer-backdrop'),
+    commandBackdrop: document.getElementById('command-backdrop'),
     themeButton: document.getElementById('theme-button'),
     drawerThemeButton: document.getElementById('drawer-theme-button'),
     live: document.getElementById('live-region'),
@@ -53,6 +56,8 @@
     rejectReason: document.getElementById('reject-reason'),
     masthead: document.querySelector('.masthead'),
     commandBand: document.querySelector('.command-band'),
+    workspace: document.querySelector('.workspace'),
+    mobileTabs: document.querySelector('.mobile-tab-bar'),
   };
 
   class RequestError extends Error {
@@ -99,6 +104,15 @@
 
   function formatNumber(value) {
     return new Intl.NumberFormat().format(Number(value) || 0);
+  }
+
+  function plainInlineText(value) {
+    return String(value ?? '')
+      .replace(/!\[([^\]]*)\]\([^)]*\)/g, '$1')
+      .replace(/\[([^\]]+)\]\([^)]*\)/g, '$1')
+      .replace(/(\*\*|__)(.*?)\1/g, '$2')
+      .replace(/([*_~`])([^\n]*?)\1/g, '$2')
+      .trim();
   }
 
   function titleFromFile(file) {
@@ -158,8 +172,13 @@
   }
 
   function setActiveNavigation(view) {
+    const activeView = view === 'digest' || view === 'home'
+      ? 'home'
+      : view === 'records' || view === 'topics' || view === 'library'
+        ? 'library'
+        : view;
     document.querySelectorAll('[data-view-link]').forEach((item) => {
-      const active = item.dataset.viewLink === view;
+      const active = item.dataset.viewLink === activeView;
       item.classList.toggle('is-active', active);
       if (item.classList.contains('nav-item')) {
         if (active) item.setAttribute('aria-current', 'page');
@@ -170,6 +189,7 @@
 
   function openDrawer() {
     if (!elements.drawer || elements.drawer.classList.contains('is-open')) return;
+    closeCommand(false);
     state.lastDrawerFocus = document.activeElement;
     elements.drawer.classList.add('is-open');
     elements.backdrop.hidden = false;
@@ -204,6 +224,22 @@
   function trapDrawerFocus(event) {
     if (event.key !== 'Tab' || !elements.drawer.classList.contains('is-open')) return;
     const focusable = [...elements.drawer.querySelectorAll('button, a[href], input, select, textarea')]
+      .filter((item) => !item.disabled && item.getClientRects().length);
+    if (!focusable.length) return;
+    const first = focusable[0];
+    const last = focusable[focusable.length - 1];
+    if (event.shiftKey && document.activeElement === first) {
+      event.preventDefault();
+      last.focus();
+    } else if (!event.shiftKey && document.activeElement === last) {
+      event.preventDefault();
+      first.focus();
+    }
+  }
+
+  function trapCommandFocus(event) {
+    if (event.key !== 'Tab' || !elements.commandBand.classList.contains('is-open')) return;
+    const focusable = [...elements.commandBand.querySelectorAll('button, input, select, textarea, a[href]')]
       .filter((item) => !item.disabled && item.getClientRects().length);
     if (!focusable.length) return;
     const first = focusable[0];
@@ -256,7 +292,7 @@
     elements.commandHelp.textContent = asking
       ? 'Answers cite retrieved excerpts. Chronicle abstains when evidence is weak.'
       : 'Find returns matching approved excerpts without generating an answer.';
-    elements.commandSubmit.textContent = asking ? 'Ask' : 'Find';
+    elements.commandSubmit.textContent = asking ? 'Answer' : 'Search';
     elements.commandError.hidden = true;
     if (focus) {
       elements.commandInput.focus();
@@ -264,10 +300,45 @@
     }
   }
 
+  function openCommand(mode = 'find') {
+    if (!elements.commandBand || !elements.commandBackdrop) return;
+    closeDrawer(false);
+    state.lastCommandFocus = document.activeElement;
+    setCommandMode(mode);
+    elements.commandBand.hidden = false;
+    elements.commandBackdrop.hidden = false;
+    elements.masthead.inert = true;
+    elements.workspace.inert = true;
+    if (elements.mobileTabs) elements.mobileTabs.inert = true;
+    requestAnimationFrame(() => {
+      elements.commandBand.classList.add('is-open');
+      elements.commandBackdrop.classList.add('is-open');
+    });
+    document.body.classList.add('command-open');
+    window.setTimeout(() => elements.commandInput.focus(), 40);
+  }
+
+  function closeCommand(restoreFocus = true) {
+    if (!elements.commandBand || !elements.commandBackdrop || elements.commandBand.hidden) return;
+    elements.commandBand.classList.remove('is-open');
+    elements.commandBackdrop.classList.remove('is-open');
+    document.body.classList.remove('command-open');
+    elements.masthead.inert = false;
+    elements.workspace.inert = false;
+    if (elements.mobileTabs) elements.mobileTabs.inert = false;
+    window.setTimeout(() => {
+      elements.commandBand.hidden = true;
+      elements.commandBackdrop.hidden = true;
+    }, 180);
+    if (restoreFocus && state.lastCommandFocus instanceof HTMLElement) {
+      state.lastCommandFocus.focus();
+    }
+  }
+
   function closeCommandResults() {
     elements.commandResults.hidden = true;
     elements.commandResults.innerHTML = '';
-    elements.commandInput.focus();
+    closeCommand();
   }
 
   let evidenceHeadingSequence = 0;
@@ -312,6 +383,9 @@
     state.commandQuery = query;
     elements.commandError.hidden = true;
     elements.commandSubmit.disabled = true;
+    document.querySelectorAll('[data-command-mode]').forEach((button) => {
+      button.disabled = true;
+    });
     elements.commandResults.hidden = false;
     elements.commandResults.innerHTML = loadingMarkup(state.commandMode === 'ask' ? 'Consulting approved memory' : 'Searching approved memory');
     announce(state.commandMode === 'ask' ? 'Consulting approved memory.' : 'Searching approved memory.');
@@ -370,7 +444,10 @@
       announce('The archive command failed.');
     } finally {
       elements.commandSubmit.disabled = false;
-      elements.commandSubmit.textContent = state.commandMode === 'ask' ? 'Ask' : 'Find';
+      document.querySelectorAll('[data-command-mode]').forEach((button) => {
+        button.disabled = false;
+      });
+      elements.commandSubmit.textContent = state.commandMode === 'ask' ? 'Answer' : 'Search';
     }
   }
 
@@ -475,11 +552,11 @@
     const factLines = draft.facts.map((item) => `${item.topic} | ${item.fact}`);
     return `
       <section class="review-editor">
-        <button class="button button-text back-button" type="button" data-back-to-queue>Back to inbox list</button>
+        <button class="button button-text back-button" type="button" data-back-to-queue>Back to review</button>
         <article class="review-surface">
           <header class="review-header">
             <div>
-              <span class="state-label">Model draft. Not approved memory.</span>
+              <span class="state-label">AI draft. Not approved memory.</span>
               <h2>${escapeHtml(draft.title)}</h2>
               <p class="meta-line">Revision ${escapeHtml(draft.revision ?? 'not reported')}</p>
             </div>
@@ -498,7 +575,25 @@
             </section>` : ''}
 
           <form id="review-form" data-review-id="${escapeHtml(draft.id)}">
-            <div class="review-columns">
+            <div class="review-focus-grid">
+              <div class="review-read">
+                <section class="memory-summary" aria-labelledby="draft-summary-heading">
+                  <h3 id="draft-summary-heading">What Chronicle understood</h3>
+                  <p>${escapeHtml(draft.summary || 'No summary was extracted.')}</p>
+                </section>
+                <div class="extraction-grid">
+                  ${summaryListMarkup('Decisions', draft.decisions)}
+                  ${summaryListMarkup('Action items', draft.actions)}
+                  ${summaryListMarkup('Open questions', draft.questions)}
+                  ${topicFactsMarkup(draft.facts)}
+                </div>
+              </div>
+              ${draftEvidenceMarkup(draft)}
+            </div>
+
+            <details class="edit-draft">
+              <summary>Edit extracted memory</summary>
+              <p class="field-help">Open the fields only when Chronicle misunderstood something.</p>
               <div class="review-fields">
                 <div class="field">
                   <label for="draft-title">Record title</label>
@@ -506,38 +601,42 @@
                 </div>
                 <div class="field">
                   <label for="draft-summary">Summary</label>
-                  <textarea id="draft-summary" name="summary" rows="6">${escapeHtml(draft.summary)}</textarea>
+                  <textarea id="draft-summary" name="summary" rows="5">${escapeHtml(draft.summary)}</textarea>
                   <p class="field-help">Use plain factual language. This becomes the approved record summary.</p>
                 </div>
                 <div class="field">
                   <label for="draft-decisions">Decisions</label>
-                  <textarea id="draft-decisions" name="decisions" rows="4" placeholder="One decision per line">${escapeHtml(lines(draft.decisions))}</textarea>
+                  <textarea id="draft-decisions" name="decisions" rows="3" placeholder="One decision per line">${escapeHtml(lines(draft.decisions))}</textarea>
                 </div>
                 <div class="field">
                   <label for="draft-actions">Action items</label>
-                  <textarea id="draft-actions" name="actions" rows="4" placeholder="Owner | Task" aria-describedby="draft-actions-help draft-actions-error">${escapeHtml(lines(actionLines))}</textarea>
+                  <textarea id="draft-actions" name="actions" rows="3" placeholder="Owner | Task" aria-describedby="draft-actions-help draft-actions-error">${escapeHtml(lines(actionLines))}</textarea>
                   <p class="field-help" id="draft-actions-help">Use one action per line in the format Owner | Task.</p>
                   <p class="field-error" id="draft-actions-error" role="alert" hidden></p>
                 </div>
-                <div class="field">
-                  <label for="draft-questions">Open questions</label>
-                  <textarea id="draft-questions" name="questions" rows="4" placeholder="One question per line">${escapeHtml(lines(draft.questions))}</textarea>
-                </div>
-                <div class="field">
-                  <label for="draft-facts">Topic facts</label>
-                  <textarea id="draft-facts" name="facts" rows="6" placeholder="Topic | Fact" aria-describedby="draft-facts-help draft-facts-error">${escapeHtml(lines(factLines))}</textarea>
-                  <p class="field-help" id="draft-facts-help">Each approved fact updates its topic page.</p>
-                  <p class="field-error" id="draft-facts-error" role="alert" hidden></p>
-                </div>
+                <details class="advanced-fields">
+                  <summary>More extracted fields</summary>
+                  <div class="advanced-fields-inner">
+                    <div class="field">
+                      <label for="draft-questions">Open questions</label>
+                      <textarea id="draft-questions" name="questions" rows="3" placeholder="One question per line">${escapeHtml(lines(draft.questions))}</textarea>
+                    </div>
+                    <div class="field">
+                      <label for="draft-facts">Topic facts</label>
+                      <textarea id="draft-facts" name="facts" rows="5" placeholder="Topic | Fact" aria-describedby="draft-facts-help draft-facts-error">${escapeHtml(lines(factLines))}</textarea>
+                      <p class="field-help" id="draft-facts-help">Each approved fact updates its topic page.</p>
+                      <p class="field-error" id="draft-facts-error" role="alert" hidden></p>
+                    </div>
+                  </div>
+                </details>
               </div>
-              ${draftEvidenceMarkup(draft)}
-            </div>
+            </details>
 
             <div class="review-actions">
               <span class="dirty-status" id="dirty-status">No unsaved edits</span>
               <button class="button button-text" type="button" data-reject-draft="${escapeHtml(draft.id)}">Reject</button>
-              <button class="button button-secondary" type="submit" data-save-draft>Save draft</button>
-              <button class="button button-primary" type="button" data-approve-draft="${escapeHtml(draft.id)}">Approve memory</button>
+              <button class="button button-secondary" type="submit" data-save-draft>Save changes</button>
+              <button class="button button-primary" type="button" data-approve-draft="${escapeHtml(draft.id)}">Approve</button>
             </div>
           </form>
         </article>
@@ -555,8 +654,8 @@
       if (!state.drafts.length) {
         state.activeDraft = null;
         setMain(`
-          <header class="view-header"><h1>Review inbox</h1><p>Captured sources wait here until a person approves what becomes memory.</p></header>
-          ${stateMarkup('empty', 'Inbox clear', 'No drafts need review. Capture a source when you are ready.', '<button class="button button-primary" type="button" data-view-link="capture">Capture source</button>')}`);
+          <header class="view-header"><h1>Review</h1><p>Everything is handled. Add a source when you want Chronicle to remember something new.</p></header>
+          ${stateMarkup('empty', 'Nothing needs review', 'Approved memory is ready whenever you need it.', '<button class="button button-primary" type="button" data-view-link="capture">Add source</button>')}`);
         return;
       }
 
@@ -567,7 +666,7 @@
       if (sequence !== state.renderSequence) return;
       state.dirty = false;
       setMain(`
-        <header class="view-header"><h1>Review inbox</h1><p>Approve only the claims, decisions, and actions that belong in durable memory.</p></header>
+        <header class="view-header"><h1>Review</h1><p>Read what Chronicle understood, check the evidence, then approve or correct it.</p></header>
         <div class="review-layout${state.activeDraft ? ' has-selection' : ''}">
           ${queueMarkup(state.drafts, state.activeDraft?.id)}
           ${state.activeDraft ? editorMarkup(state.activeDraft) : stateMarkup('empty', 'Choose a draft', 'Open the next capture to inspect its evidence and extraction.')}
@@ -576,7 +675,7 @@
       if (sequence !== state.renderSequence) return;
       const unavailable = error instanceof RequestError && error.status === 501;
       setMain(`
-        <header class="view-header"><h1>Review inbox</h1><p>Captured sources stay separate from approved memory.</p></header>
+        <header class="view-header"><h1>Review</h1><p>Captured sources stay separate from approved memory.</p></header>
         ${unavailable
           ? `<div class="notice"><strong>Partial setup.</strong> Archive reading still works, but this build does not expose the review workflow.</div>${stateMarkup('error', 'Review is not available', error.message, '<button class="button button-secondary" type="button" data-retry-view="inbox">Check again</button>')}`
           : stateMarkup('error', 'Could not load the inbox', error.message || 'The review queue could not be read.', '<button class="button button-secondary" type="button" data-retry-view="inbox">Retry</button>')}`);
@@ -756,7 +855,14 @@
   function summaryListMarkup(title, items) {
     const values = safeArray(items);
     if (!values.length) return '';
-    return `<section><h3>${escapeHtml(title)}</h3><ul>${values.map((item) => `<li>${escapeHtml(typeof item === 'string' ? item : item.task || item.fact || '')}</li>`).join('')}</ul></section>`;
+    return `<section><h3>${escapeHtml(title)}</h3><ul>${values.map((item) => {
+      if (typeof item === 'string') return `<li>${escapeHtml(item)}</li>`;
+      const record = objectValue(item);
+      const text = record.owner && record.task
+        ? `${record.owner}: ${record.task}`
+        : record.task || record.fact || '';
+      return `<li>${escapeHtml(text)}</li>`;
+    }).join('')}</ul></section>`;
   }
 
   function topicFactsMarkup(items) {
@@ -993,6 +1099,28 @@
       </aside>`;
   }
 
+  function libraryTabsMarkup(view) {
+    return `
+      <div class="library-tabs" role="group" aria-label="Library collection">
+        <button class="mode-button${view === 'records' ? ' is-active' : ''}" type="button" data-view-link="records" aria-pressed="${view === 'records'}">Records</button>
+        <button class="mode-button${view === 'topics' ? ' is-active' : ''}" type="button" data-view-link="topics" aria-pressed="${view === 'topics'}">Topics</button>
+      </div>`;
+  }
+
+  function libraryBoardMarkup(items, type) {
+    return `
+      <ol class="library-board" aria-label="${escapeHtml(type)}">
+        ${items.map((item) => `
+          <li class="library-pin">
+            <button type="button" data-library-file="${escapeHtml(item.file)}" data-library-type="${escapeHtml(type.toLowerCase())}">
+              <span class="record-type">${escapeHtml(item.type || (type === 'Topics' ? 'topic' : 'record'))}</span>
+              <strong>${escapeHtml(item.title || titleFromFile(item.file))}</strong>
+              <span class="record-item-meta">${item.updatedAt ? escapeHtml(formatDate(item.updatedAt)) : 'Approved memory'}</span>
+            </button>
+          </li>`).join('')}
+      </ol>`;
+  }
+
   function articleBodyHtml(html) {
     const withoutRepeatedTitle = String(html || '').replace(/^\s*<h1>[\s\S]*?<\/h1>\s*/i, '');
     return withoutRepeatedTitle.replace(/<(\/?)h([1-3])>/gi, (_match, closing, level) => {
@@ -1033,20 +1161,20 @@
       state.selectedNote = file ? await loadNote(file) : null;
       if (sequence !== state.renderSequence) return;
       setMain(`
-        <header class="view-header"><h1>${type}</h1><p>${view === 'topics'
-          ? 'Durable subjects collect approved facts and links back to their source records.'
-          : 'Approved captures remain portable Markdown with their source context intact.'}</p></header>
+        <header class="view-header library-header"><h1>Library</h1><p>${view === 'topics'
+          ? 'Follow the durable subjects that have formed across approved memory.'
+          : 'Browse approved captures as a living collection, with every source still attached.'}</p>${libraryTabsMarkup(view)}</header>
         ${items.length ? `
-          <div class="library-layout${state.selectedNote ? ' has-selection' : ''}">
+          ${state.selectedNote ? `<div class="library-layout has-selection">
             ${libraryListMarkup(items, file, type)}
-            ${state.selectedNote ? noteMarkup(state.selectedNote, view) : stateMarkup('empty', `Choose a ${view === 'topics' ? 'topic' : 'record'}`, `Open one of ${items.length} approved ${view}.`)}
-          </div>` : stateMarkup('empty', `No ${view} yet`, view === 'topics'
+            ${noteMarkup(state.selectedNote, view)}
+          </div>` : libraryBoardMarkup(items, type)}` : stateMarkup('empty', `No ${view} yet`, view === 'topics'
             ? 'Topics appear after an approved draft contributes factual knowledge.'
             : 'Approve a review draft to create the first durable record.')}`);
     } catch (error) {
       if (sequence !== state.renderSequence) return;
       setMain(`
-        <header class="view-header"><h1>${view === 'topics' ? 'Topics' : 'Records'}</h1></header>
+        <header class="view-header"><h1>Library</h1>${libraryTabsMarkup(view)}</header>
         ${stateMarkup('error', `Could not load ${view}`, error instanceof Error ? error.message : 'The archive could not be read.', `<button class="button button-secondary" type="button" data-retry-view="${escapeHtml(view)}">Retry</button>`)}`);
     } finally {
       elements.main.setAttribute('aria-busy', 'false');
@@ -1058,58 +1186,89 @@
     if (!values.length) return `<p class="field-help">${escapeHtml(emptyText)}</p>`;
     return `<ul class="digest-list">${values.map((item) => {
       const record = objectValue(item);
-      const text = record.text || record.title || String(item);
+      const text = plainInlineText(record.text || record.title || String(item));
       return `<li>${record.file
         ? `<button class="button button-text" type="button" data-note-file="${escapeHtml(record.file)}">${escapeHtml(text)}</button>`
         : escapeHtml(text)}${record.title && record.text ? `<div class="source-path">${escapeHtml(record.title)}</div>` : ''}</li>`;
     }).join('')}</ul>`;
   }
 
-  async function renderDigest(options = {}) {
+  async function renderHome(options = {}) {
     const sequence = ++state.renderSequence;
-    state.view = 'digest';
-    setActiveNavigation('digest');
-    setMain(loadingMarkup('Building weekly digest'), true);
+    state.view = 'home';
+    setActiveNavigation('home');
+    setMain(loadingMarkup('Loading your workspace'), true);
     try {
-      const data = await api('/api/digest');
+      const [data] = await Promise.all([
+        api('/api/digest'),
+        ensureDrafts(Boolean(options.force)).catch(() => undefined),
+      ]);
       if (sequence !== state.renderSequence) return;
       const partial = safeArray(data.partial);
+      const reviewCount = data.reviewCount === null
+        ? state.drafts.length
+        : Number(data.reviewCount || 0);
+      const nextDraft = state.drafts[0];
       setMain(`
-        <header class="view-header"><h1>Weekly Chronicle</h1><p>A factual rollup from approved records and the current review queue.</p></header>
-        ${partial.length ? `<div class="notice"><strong>Partial digest.</strong> ${escapeHtml(partial.join(' '))}</div>` : ''}
-        <div class="digest-grid">
-          <div class="digest-stack">
-            <section class="digest-section">
-              <h2>Recent approved records</h2>
-              ${digestItems(data.recentRecords, 'No records were approved in the last seven days.', 'record')}
-            </section>
-            <section class="digest-section">
-              <h2>Open actions</h2>
-              ${digestItems(data.openActions, 'No open actions were found in recent approved records.', 'action')}
-            </section>
-            <section class="digest-section">
-              <h2>Open questions</h2>
-              ${digestItems(data.openQuestions, 'No open questions were found in recent approved records.', 'question')}
-            </section>
-          </div>
-          <div class="digest-stack">
-            <section class="digest-section">
-              <h2>Review queue</h2>
-              <div class="digest-metric"><strong class="tabular">${data.reviewCount === null ? '?' : escapeHtml(formatNumber(data.reviewCount))}</strong><span>drafts waiting</span></div>
-              <div class="state-actions"><button class="button button-secondary" type="button" data-view-link="inbox">Open inbox</button></div>
-            </section>
-            <section class="digest-section">
-              <h2>Knowledge spine</h2>
-              <div class="digest-metric"><strong class="tabular">${escapeHtml(formatNumber(data.topicCount))}</strong><span>topics</span></div>
-              <p class="field-help">Generated ${escapeHtml(formatDate(data.generatedAt, true))}</p>
-            </section>
-          </div>
+        <header class="view-header home-header">
+          <h1>${reviewCount ? `${escapeHtml(formatNumber(reviewCount))} draft${reviewCount === 1 ? '' : 's'} need your attention.` : 'Your memory is ready.'}</h1>
+          <p>${reviewCount ? 'Start with the next capture, verify what matters, and keep the archive trustworthy.' : 'Search what you know, revisit recent decisions, or add something new.'}</p>
+        </header>
+        ${partial.length ? `<div class="notice"><strong>Some home data is unavailable.</strong> ${escapeHtml(partial.join(' '))}</div>` : ''}
+        <div class="home-grid">
+          <section class="home-tile home-review-tile${reviewCount ? ' has-work' : ''}">
+            <div class="home-tile-copy">
+              <span class="home-tile-label">Review</span>
+              <strong class="home-number tabular">${escapeHtml(formatNumber(reviewCount))}</strong>
+              <h2>${reviewCount ? (nextDraft ? escapeHtml(nextDraft.title) : 'Drafts are waiting') : 'All clear'}</h2>
+              <p>${reviewCount ? 'Check the extraction and its evidence before it becomes memory.' : 'No captured sources are waiting for approval.'}</p>
+            </div>
+            <button class="button ${reviewCount ? 'button-primary' : 'button-secondary'}" type="button"${nextDraft ? ` data-draft-id="${escapeHtml(nextDraft.id)}"` : ' data-view-link="inbox"'}>${reviewCount ? 'Review next' : 'Open review'}</button>
+          </section>
+
+          <section class="home-tile home-search-tile">
+            <div class="home-tile-copy">
+              <span class="home-tile-label">Recall</span>
+              <h2>What are you trying to remember?</h2>
+              <p>Ask naturally or search for the exact phrase. Every answer stays tied to evidence.</p>
+            </div>
+            <button class="button button-inverse" type="button" data-command-link="ask">Search memory</button>
+          </section>
+
+          <section class="home-tile home-recent-tile">
+            <div class="home-tile-heading">
+              <div><span class="home-tile-label">Recently approved</span><h2>Fresh memory</h2></div>
+              <button class="button button-text" type="button" data-view-link="library">Open library</button>
+            </div>
+            ${digestItems(data.recentRecords, 'Approved records will appear here.', 'record')}
+          </section>
+
+          <section class="home-tile home-actions-tile">
+            <span class="home-tile-label">Open actions</span>
+            <h2>What still needs doing</h2>
+            ${digestItems(data.openActions, 'No open actions were found in recent records.', 'action')}
+          </section>
+
+          <section class="home-tile home-library-tile">
+            <span class="home-tile-label">Library</span>
+            <strong class="home-number tabular">${escapeHtml(formatNumber(data.topicCount))}</strong>
+            <h2>Connected topics</h2>
+            <p>Browse approved records by source or follow the topics they have built over time.</p>
+            <button class="button button-secondary" type="button" data-view-link="library">Browse memory</button>
+          </section>
+
+          <section class="home-tile home-add-tile">
+            <span class="home-tile-label">Add</span>
+            <h2>Bring in something new</h2>
+            <p>Preview a meeting, document, video, or article before it enters review.</p>
+            <button class="button button-primary" type="button" data-view-link="capture">Add source</button>
+          </section>
         </div>`);
     } catch (error) {
       if (sequence !== state.renderSequence) return;
       setMain(`
-        <header class="view-header"><h1>Weekly Chronicle</h1></header>
-        ${stateMarkup('error', 'Could not build the digest', error instanceof Error ? error.message : 'The archive rollup failed.', '<button class="button button-secondary" type="button" data-retry-view="digest">Retry</button>')}`);
+        <header class="view-header"><h1>Home</h1></header>
+        ${stateMarkup('error', 'Could not load your workspace', error instanceof Error ? error.message : 'The home view failed.', '<button class="button button-secondary" type="button" data-retry-view="home">Retry</button>')}`);
     } finally {
       elements.main.setAttribute('aria-busy', 'false');
     }
@@ -1136,7 +1295,7 @@
           ? 'Stale. Run npm run index.'
           : `Ready with ${formatNumber(index.chunks)} chunks`;
     return `
-      <header class="view-header"><h1>Trust centre</h1><p>See what Chronicle can access, what leaves the machine, and which safeguards are ready.</p></header>
+      <header class="view-header"><h1>Settings</h1><p>See what Chronicle can access, what leaves the machine, and which safeguards are ready.</p></header>
       <section class="trust-summary">
         <div class="trust-mark" data-level="${data.ok ? 'ready' : 'attention'}">${data.ok ? 'OK' : '!'}</div>
         <div><h2>${data.ok ? 'Ready for reviewed memory' : 'Setup needs attention'}</h2><p>${data.ok
@@ -1220,7 +1379,7 @@
     } catch (error) {
       if (sequence !== state.renderSequence) return;
       setMain(`
-        <header class="view-header"><h1>Trust centre</h1></header>
+        <header class="view-header"><h1>Settings</h1></header>
         ${stateMarkup('error', 'Health check failed', error instanceof Error ? error.message : 'Chronicle could not inspect its safeguards.', '<button class="button button-secondary" type="button" data-retry-view="trust">Retry</button>')}`);
       updateCompactHealth(null, true);
     } finally {
@@ -1233,14 +1392,14 @@
       elements.healthState.textContent = 'Unavailable';
       elements.healthState.dataset.level = 'error';
       elements.healthDetail.textContent = 'Health check failed';
-      elements.healthButton.setAttribute('aria-label', 'Chronicle health check unavailable. Open Trust centre.');
+      elements.healthButton.setAttribute('aria-label', 'Chronicle health check unavailable. Open Settings.');
       return;
     }
     if (!data) {
       elements.healthState.textContent = 'Checking';
       elements.healthState.dataset.level = 'attention';
-      elements.healthDetail.textContent = 'Archive health';
-      elements.healthButton.setAttribute('aria-label', 'Checking Chronicle health. Open Trust centre.');
+      elements.healthDetail.textContent = 'System health';
+      elements.healthButton.setAttribute('aria-label', 'Checking Chronicle health. Open Settings.');
       return;
     }
     elements.healthState.textContent = data.ok ? 'Ready' : 'Attention';
@@ -1249,8 +1408,8 @@
     elements.healthButton.setAttribute(
       'aria-label',
       data.ok
-        ? 'Chronicle health ready. All checks passed. Open Trust centre.'
-        : `Chronicle health needs attention. ${safeArray(data.issues).length} checks need work. Open Trust centre.`,
+        ? 'Chronicle health ready. All checks passed. Open Settings.'
+        : `Chronicle health needs attention. ${safeArray(data.issues).length} checks need work. Open Settings.`,
     );
   }
 
@@ -1274,7 +1433,7 @@
   }
 
   function parseRoute() {
-    const raw = location.hash.replace(/^#/, '') || 'inbox';
+    const raw = location.hash.replace(/^#/, '') || 'home';
     if (raw.startsWith('/note/')) {
       const file = decodeURIComponent(raw.slice('/note/'.length));
       return { view: /(^|\/)topics\//.test(file) ? 'topics' : 'records', file };
@@ -1284,12 +1443,15 @@
     const detail = slash < 0 ? '' : decodeURIComponent(raw.slice(slash + 1));
     if (view === 'inbox') return { view, id: detail || undefined };
     if (view === 'records' || view === 'topics') return { view, file: detail || undefined };
-    if (['capture', 'digest', 'trust'].includes(view)) return { view };
-    return { view: 'inbox' };
+    if (view === 'library') return { view: 'records' };
+    if (view === 'home' || view === 'digest') return { view: 'home' };
+    if (['capture', 'trust'].includes(view)) return { view };
+    return { view: 'home' };
   }
 
   async function renderRoute(options = {}) {
     closeDrawer(false);
+    closeCommand(false);
     const route = parseRoute();
     if (state.view === 'capture' && route.view !== 'capture') {
       state.captureRequestSequence += 1;
@@ -1297,12 +1459,12 @@
         state.captureStatus = state.capturePreview ? 'ready' : 'idle';
       }
     }
-    if (route.view === 'inbox') await renderInbox({ id: route.id, force: options.force });
+    if (route.view === 'home') await renderHome(options);
+    else if (route.view === 'inbox') await renderInbox({ id: route.id, force: options.force });
     else if (route.view === 'capture') renderCapture();
     else if (route.view === 'records' || route.view === 'topics') await renderLibrary(route.view, { file: route.file, force: options.force });
-    else if (route.view === 'digest') await renderDigest(options);
     else if (route.view === 'trust') await renderTrust(options);
-    state.lastSafeHash = location.hash || '#inbox';
+    state.lastSafeHash = location.hash || '#home';
     if (options.focus !== false) focusMain(Boolean(route.id || route.file));
   }
 
@@ -1338,11 +1500,10 @@
       goToView(target.dataset.viewLink);
     } else if (target.matches('[data-command-link]')) {
       event.preventDefault();
-      closeDrawer(false);
-      setCommandMode(target.dataset.commandLink, true);
+      openCommand(target.dataset.commandLink);
     } else if (target.matches('[data-command-mode]')) {
       setCommandMode(target.dataset.commandMode, true);
-    } else if (target.matches('[data-close-command]')) {
+    } else if (target.matches('[data-close-command], [data-dismiss-command]')) {
       closeCommandResults();
     } else if (target.matches('[data-command-retry]')) {
       runCommand(state.commandQuery);
@@ -1435,12 +1596,25 @@
     else openDrawer();
   });
   elements.backdrop.addEventListener('click', () => closeDrawer(true));
+  elements.commandBackdrop.addEventListener('click', () => closeCommand(true));
   elements.themeButton.addEventListener('click', cycleTheme);
   elements.drawerThemeButton.addEventListener('click', cycleTheme);
 
   document.addEventListener('keydown', (event) => {
     trapDrawerFocus(event);
+    trapCommandFocus(event);
     if (event.key === 'Escape' && elements.drawer.classList.contains('is-open')) closeDrawer(true);
+    else if (event.key === 'Escape' && elements.commandBand.classList.contains('is-open')) closeCommand(true);
+    const target = event.target;
+    const typing = target instanceof HTMLInputElement || target instanceof HTMLTextAreaElement || target instanceof HTMLSelectElement || target?.isContentEditable;
+    if (!typing && event.key === '/') {
+      event.preventDefault();
+      openCommand('find');
+    }
+    if (!typing && (event.metaKey || event.ctrlKey) && event.key.toLowerCase() === 'k') {
+      event.preventDefault();
+      openCommand('ask');
+    }
     if ((event.metaKey || event.ctrlKey) && event.key.toLowerCase() === 's' && document.getElementById('review-form')) {
       event.preventDefault();
       if (state.activeDraft && !state.pending) saveDraft(state.activeDraft.id).catch(() => {});

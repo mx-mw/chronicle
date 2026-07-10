@@ -6,7 +6,7 @@
 - Path: `/Users/ethanwu/Developer/chronicle`
 - Owners: Ethan Wu and Max Morrow
 - Surface: Local-first knowledge operations tool
-- Status: v2 hardening and workflow redesign
+- Status: task-first organic workspace redesign
 - Last updated: 2026-07-10
 
 ## Purpose
@@ -28,15 +28,18 @@ Primary users are Ethan and Max. They care about:
 
 ## Primary feeling
 
-A calm working archive. Editorial enough to feel considered, operational enough
-to make state, risk, and next actions obvious.
+A living memory workspace. It should feel calm, tactile, and immediately
+understandable: Chronicle brings the next meaningful action forward, then lets
+approved knowledge unfold naturally as the user explores it.
 
 ## References
 
-1. Typography and reading: Readwise Reader for long-form legibility and evidence.
-2. Review workflow: Granola for meeting-note review with low interaction cost.
-3. Knowledge structure: Obsidian for linked Markdown, backlinks, and portability.
-4. Operational status: Linear for concise state language and fast keyboard flow.
+1. Apple Watch: glanceable modules, purposeful depth, compact state changes, and
+   controls that feel physical without becoming ornamental.
+2. Pinterest: content-first discovery, asymmetric rhythm, and collections that
+   feel browsable rather than database-like.
+3. Readwise Reader: long-form legibility and fast retrieval.
+4. Granola: low-friction meeting-note review and evidence inspection.
 
 These are behavioral references, not a request to imitate their visual systems.
 
@@ -44,61 +47,63 @@ These are behavioral references, not a request to imitate their visual systems.
 
 First viewport:
 
-1. Chronicle identity and compact readiness state.
-2. Inbox count and the next record needing review.
-3. One clear Ask or Find command surface.
+1. The next draft requiring a decision, when one exists.
+2. Recent approved memory and unfinished actions when review is clear.
+3. Direct actions to add a source or search memory.
 
 Secondary:
 
-1. Recent approved records.
-2. Topics and maintenance suggestions.
-3. Trust policy, system diagnostics, and weekly digest.
+1. Library discovery across records and topics.
+2. Evidence, raw sources, and advanced extraction fields on demand.
+3. Trust policy and diagnostics inside Settings.
 
 ## Visual system
 
 ### Typography
 
-- Display and reading: Iowan Old Style with Palatino and Georgia fallbacks.
-- Interface: system sans stack.
-- Technical metadata: system mono stack.
+- Interface and display: the native Apple system family, with Avenir Next as a
+  characterful fallback on macOS.
+- Long approved records: Charter and Georgia fallbacks, used only for reading.
+- Technical metadata: the native system mono family.
 - Headings use balanced wrapping; short body text uses pretty wrapping.
 - Dynamic counts and durations use tabular figures.
 
-The serif is retained because Chronicle is explicitly an archive and reading
-environment. Operational controls remain sans-serif.
-
 ### Color
 
-- Background: warm paper, `#f3eee3`.
-- Surface: pale paper, `#fbf8f1`.
-- Ink: soft near-black, `#2a2620`.
-- Muted text: darkened warm gray that passes WCAG AA at small sizes.
-- Accent: restrained brick, `#8a3324`.
-- Warning: ochre-brown; error: deep red; success: forest green.
-- Dark mode stays in the same warm ink family.
+- Background: cool mineral mist, `#f2f2ef`.
+- Surface: soft white, `#fbfbf9`.
+- Ink: graphite, `#20201e`.
+- Muted text: mineral gray that passes WCAG AA at small sizes.
+- Accent: deep carmine, `#a62d2d`, shared by actions and active states.
+- Warning, error, and success remain semantic and appear only where state is real.
+- Dark mode uses neutral charcoal surfaces rather than brown-on-brown ink.
 
 ### Layout
 
-- Maximum width: 1240px.
-- Desktop: compact top bar, command surface, then navigation rail and reader.
-- Review views use a two-column evidence layout where space permits.
-- Mobile: reader-first. Navigation lives in a drawer or compact picker and never
-  pushes selected content below the full record list.
+- Maximum width: 1440px.
+- Desktop: slim navigation rail, content workspace, and optional evidence rail.
+- Home uses an asymmetric grid of real work: next review, recent records, open
+  actions, and library state. Tile size follows information importance.
+- Library starts as a masonry-like board and becomes list plus reader after a
+  record is selected.
+- Search is an on-demand overlay, never a permanent band above every task.
+- Mobile uses a compact bottom navigation and full-screen task transitions.
 - Page gutters remain at least 16px on 390px screens.
 
 ### Shape
 
-- Panels: 12px radius.
-- Inputs and buttons: 8px radius.
-- Small metadata markers: 4px radius, not pills by default.
-- Depth uses warm layered shadows; dividers remain hairline borders.
+- Primary modules: 24px radius.
+- Nested surfaces: 16px radius with concentric spacing.
+- Inputs and buttons: 12px radius; compact segmented controls may use pills.
+- Depth uses layered mineral shadows; dividers remain hairline rules.
 
 ### Motion
 
-- `DESIGN_VARIANCE: 5`
-- `MOTION_INTENSITY: 3`
+- `DESIGN_VARIANCE: 7`
+- `MOTION_INTENSITY: 4`
 - `VISUAL_DENSITY: 6`
-- Motion communicates state changes only: drawers, selection, saving, approval.
+- Motion communicates state changes only: search reveal, selection, saving,
+  evidence disclosure, and approval.
 - Interactive transitions are interruptible and limited to transform, opacity,
   color, and box-shadow.
 - Buttons scale to `0.96` on press.
@@ -106,9 +111,10 @@ environment. Operational controls remain sans-serif.
 
 ## Components
 
-- Navigation: Inbox, Capture, Records, Topics, Ask/Find, Digest, Trust.
-- Command surface: one input with explicit Ask and Find modes.
-- Review record: source context, warnings, editable extraction, evidence, actions.
+- Navigation: Home, Review, Library, and Settings.
+- Global actions: Add source and Search memory.
+- Search surface: one overlay with answer and exact-match modes.
+- Review record: readable extraction first, editing and advanced fields on demand.
 - Status: plain state labels with one semantic indicator only where live state is
   real.
 - Buttons: primary, secondary, text action, destructive confirmation.
@@ -123,6 +129,10 @@ environment. Operational controls remain sans-serif.
 - Destructive actions require explicit confirmation.
 - Recall answers display validated evidence or an insufficient-evidence state.
 - Search results open the selected record without losing the user on mobile.
+- Review opens on the next draft on desktop and as a focused queue-to-detail flow
+  on mobile.
+- Evidence remains available beside the draft but never competes with the primary
+  approve decision.
 - Every asynchronous action exposes pending, success, partial, and failure states.
 - No placeholder-only form labels.
 - Interactive hit areas are at least 40px.
@@ -132,7 +142,8 @@ environment. Operational controls remain sans-serif.
 - No generic purple or blue SaaS gradients.
 - No decorative blobs, grids, glass, or glows.
 - No three-equal-card dashboard as the primary structure.
-- No over-rounded controls or decorative pills.
+- No roundness without hierarchy: large modules, smaller nested surfaces, and
+  compact controls follow a documented concentric scale.
 - No vague AI copy or invented metrics.
 - No decorative status dots.
 - No desktop layout that merely stacks the entire navigation above content.
