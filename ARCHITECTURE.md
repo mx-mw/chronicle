@@ -185,7 +185,7 @@ behavior.
 
 ## Release gates
 
-- Node 22.13 or newer
+- Node 22.16 or newer
 - TypeScript build and production web smoke test
 - Unit and integration tests for policy, review, persistence, indexing, and web
 - Live Discord smoke test in one private allowlisted channel

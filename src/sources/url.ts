@@ -239,7 +239,6 @@ async function resolveWithDeadline(
     timeoutMs,
   );
   const timer = setTimeout(() => controller.abort(timeoutError), timeoutMs);
-  timer.unref();
   let removeAbortListener = () => {};
   try {
     const aborted = new Promise<never>((_resolve, reject) => {

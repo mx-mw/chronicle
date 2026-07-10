@@ -24,7 +24,7 @@
     "check": "npm run typecheck && npm test && npm run build && npm run smoke:web"
   },
   "engines": {
-    "node": ">=22.13.0"
+    "node": ">=22.16.0"
   },
   "dependencies": {
     "@anthropic-ai/sdk": "^0.110.0",

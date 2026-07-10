@@ -77,7 +77,7 @@ a local OpenAI-compatible server or, only when selected explicitly, Anthropic.
 
 ## Requirements
 
-- Node.js 22.13 or newer
+- Node.js 22.16 or newer
 - ffmpeg and ffprobe
 - Parakeet MLX for meeting audio
 - A local OpenAI-compatible embedding endpoint such as Ollama for semantic
@@ -384,7 +384,7 @@ npm audit
 
 `npm run check` is the local release gate: strict TypeScript, the full unit and
 integration suite, production build, and compiled web smoke test. CI runs it on
-Node 22.13 and the current Node 24 release.
+Node 22.16 and the current Node 24 release.
 
 The remaining environment-specific release gate is a live Discord smoke test in
 one private allowlisted channel. It is intentionally not automated because it

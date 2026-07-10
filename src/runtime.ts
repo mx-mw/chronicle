@@ -120,7 +120,6 @@ export async function withTimeout<T>(
       () => reject(new TimeoutError(`${label} exceeded its ${timeoutMs}ms timeout`, timeoutMs)),
       timeoutMs,
     );
-    timer.unref();
   });
   try {
     return await Promise.race([operation, timeout]);
