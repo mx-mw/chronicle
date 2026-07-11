@@ -36,6 +36,18 @@ export function booleanEnv(name: string, fallback = false): boolean {
   throw new Error(`${name} must be true or false.`);
 }
 
+export function isLoopbackHost(raw: string): boolean {
+  const host = raw.trim().toLowerCase().replace(/^\[|\]$/g, '').replace(/\.$/, '');
+  if (host === 'localhost' || host === '::1') return true;
+  const version = isIP(host);
+  if (version === 4) return host.split('.')[0] === '127';
+  if (version !== 6) return false;
+
+  // URL canonicalization handles dotted and expanded IPv4-mapped IPv6 forms.
+  const canonical = new URL(`http://[${host}]`).hostname.replace(/^\[|\]$/g, '');
+  return canonical === '::1' || /^::ffff:7f[0-9a-f]{2}:/i.test(canonical);
+}
+
 export function isLoopbackUrl(raw: string): boolean {
   let url: URL;
   try {
@@ -43,9 +55,7 @@ export function isLoopbackUrl(raw: string): boolean {
   } catch {
     return false;
   }
-  const host = url.hostname.replace(/^\[|\]$/g, '').toLowerCase();
-  if (host === 'localhost' || host === '::1') return true;
-  return isIP(host) === 4 && host.split('.')[0] === '127';
+  return isLoopbackHost(url.hostname);
 }
 
 export function assertModelEndpointAllowed(raw: string, label: string): void {

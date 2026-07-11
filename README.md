@@ -72,8 +72,8 @@ a local OpenAI-compatible server or, only when selected explicitly, Anthropic.
   drafts.
 - **Tasks:** track approved action items through open/done lifecycle state while
   preserving their source meetings and carryover history.
-- **Processing:** inspect active captures and every transcription/distillation
-  stage without waiting for a final draft.
+- **Processing status:** the API and Trust view expose active and attention
+  counts. A dedicated processing timeline is not implemented in the web app.
 - **Trust:** inspect policy, model, index, and archive readiness.
 - **Discord:** consent-aware recording plus guild-scoped recall.
 - **CLI:** batch ingest, review, retrieval, indexing, diagnostics, digest, and
@@ -105,9 +105,10 @@ model download, run Parakeet once with `HF_HUB_DISABLE_XET=1`.
 
 1. Create a Discord application at
    <https://discord.com/developers/applications>. Invite it with the `bot` and
-   `applications.commands` scopes and the View Channels, Send Messages, and
-   Connect permissions. Voice recording and commands need no privileged intent.
-   The optional Chronicle Inbox described below requires Message Content.
+   `applications.commands` scopes and the View Channels and Send Messages
+   permissions. Add Connect for voice recording. Voice recording and commands
+   need no privileged intent. The optional Chronicle Inbox described below also
+   requires Read Message History plus the Message Content privileged intent.
 
 2. Create the local configuration:
 
@@ -174,6 +175,11 @@ model download, run Parakeet once with `HF_HUB_DISABLE_XET=1`.
    ollama pull nomic-embed-text
    ```
 
+   `qwen2.5:3b` is a low-resource development default, not a production-quality
+   extraction guarantee. Acceptance testing shows that it can omit explicit
+   decisions and action items. Keep review enabled, or configure a stronger
+   explicitly disclosed provider before relying on automatic filing.
+
    If Anthropic handles distillation and recall, only the embedding model is
    required locally. Without an embedding endpoint, keyword-only recall still
    works, but semantic search is degraded and `doctor` will report the missing
@@ -183,9 +189,12 @@ model download, run Parakeet once with `HF_HUB_DISABLE_XET=1`.
 
    ```sh
    npm run index
-   npm run doctor
+   npm run doctor -- --bot
    npm run doctor -- --offline
    ```
+
+   `--bot` makes a missing Discord token or incomplete Discord policy a failed
+   readiness check. Omit it only for CLI/web-only operation.
 
 6. Start the web app and Discord bot in separate terminals:
 
@@ -305,7 +314,7 @@ without persisting the source or a draft:
 ```sh
 npm run ingest -- notes.txt --preview
 npm run ingest -- notes.txt --approve
-npm run ingest -- notes.txt --json
+npm run --silent ingest -- notes.txt --json
 ```
 
 Source size, duration, command, download, model, and transcription limits are
@@ -321,7 +330,8 @@ outside that browser boundary.
 
 Chronicle combines SQLite FTS5 keyword results with local cosine similarity.
 Topic notes receive a small ranking preference because they contain the durable
-fact, while exact identifiers remain discoverable through keyword search.
+fact. Exact identifiers remain keyword-searchable only when the approved record
+or topic retained them; raw transcripts are deliberately not indexed.
 Candidates below the vector relevance floor are excluded.
 
 ```sh
@@ -332,7 +342,7 @@ npm run index -- --force
 npm run recall -- "what did we decide about storage?"
 npm run recall -- "storage" --raw
 npm run recall -- "invoice-8472" --keyword-only
-npm run recall -- "what changed?" --workspace project-a --json
+npm run --silent recall -- "what changed?" --workspace project-a --json
 ```
 
 The model receives only retrieved excerpts for recall. Its cited filenames are
@@ -346,7 +356,7 @@ archive remains readable even if every derived database is deleted.
 
 ```sh
 npm run digest
-npm run digest -- --days 14 --workspace project-a --json
+npm run --silent digest -- --days 14 --workspace project-a --json
 npm run digest -- --write
 
 npm run maintain
@@ -411,8 +421,10 @@ distillation and retrieved excerpts needed for recall to Anthropic. The corpus
 and embeddings are not uploaded as a batch. This mode requires an explicit API
 key and should be treated as an off-machine data-processing choice.
 
-For remote web access, set a strong `WEB_AUTH_TOKEN`, restrict
-`WEB_ALLOWED_HOSTS`, and put Chronicle behind trusted encrypted transport. The
+For remote web access, set a strong `WEB_AUTH_TOKEN`, configure exact
+`WEB_ALLOWED_HOSTS`, and put Chronicle behind trusted encrypted transport.
+Unspecified binds such as `0.0.0.0` refuse to start without an explicit host
+allowlist. The
 server accepts Bearer auth and HTTP Basic password auth. Loopback access needs
 no token. Remote encrypted-source routes are fixed to `WEB_WORKSPACE_ID` and
 ignore `X-Chronicle-Workspace`; this is full operator access to that one
@@ -444,6 +456,7 @@ every encrypted-source Library API read and by an hourly web-server sweep.
 | `PROCESSING_RETRIES` | `2` | Retries after the initial queue attempt |
 | `WEB_HOST` / `WEB_PORT` | `127.0.0.1` / `4321` | Web bind address |
 | `WEB_AUTH_TOKEN` | empty | Required for a non-loopback bind |
+| `WEB_ALLOWED_HOSTS` | empty | Exact accepted Host names; required for `0.0.0.0` or `::` |
 | `WEB_INGEST_ROOT` | empty | Optional realpath boundary for browser local-file capture |
 
 See [.env.example](.env.example) for the complete operational configuration.

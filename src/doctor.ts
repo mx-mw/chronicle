@@ -7,7 +7,8 @@ import { fileURLToPath } from 'node:url';
 import { promisify } from 'node:util';
 import { config, environmentFileSecurity } from './config.js';
 import { ensurePrivateDirectory } from './fs-safe.js';
-import { assertModelEndpointAllowed, isLoopbackUrl } from './runtime.js';
+import { completeDiscordPolicy } from './policy.js';
+import { assertModelEndpointAllowed, isLoopbackHost, isLoopbackUrl } from './runtime.js';
 import { EncryptedSourceCatalog } from './source-catalog.js';
 import { getIndexHealth } from './store.js';
 
@@ -54,6 +55,27 @@ export function meetsMinimumVersion(
     if (current[i] < minimum[i]) return false;
   }
   return true;
+}
+
+export function discordTokenStatus(configured: boolean, required: boolean): DoctorStatus {
+  if (configured) return 'pass';
+  return required ? 'fail' : 'warn';
+}
+
+export function webBindingIssue(
+  host: string,
+  token: string | undefined,
+  allowedHosts: string | undefined,
+): string | undefined {
+  const loopback = isLoopbackHost(host);
+  if (loopback) return undefined;
+  if (!token?.trim()) return `WEB_HOST=${host} is not loopback and WEB_AUTH_TOKEN is empty`;
+  const unspecified = host === '0.0.0.0' || host === '::';
+  const exactHosts = (allowedHosts ?? '').split(',').map((value) => value.trim()).filter(Boolean);
+  if (unspecified && exactHosts.length === 0) {
+    return `WEB_HOST=${host} requires at least one exact WEB_ALLOWED_HOSTS entry`;
+  }
+  return undefined;
 }
 
 async function executableCheck(
@@ -172,11 +194,7 @@ function policyChecks(discordConfigured = Boolean(process.env.DISCORD_TOKEN)): D
     recordPolicy.channelIds.length +
     recordPolicy.userIds.length +
     recordPolicy.roleIds.length;
-  const recordComplete = Boolean(
-    recordPolicy.guildIds.length &&
-      recordPolicy.channelIds.length &&
-      (recordPolicy.userIds.length || recordPolicy.roleIds.length),
-  );
+  const recordComplete = completeDiscordPolicy(recordPolicy);
 
   if (!autoRecord) {
     checks.push(check('auto-record', 'Automatic recording', 'pass', 'Disabled by default'));
@@ -219,11 +237,7 @@ function policyChecks(discordConfigured = Boolean(process.env.DISCORD_TOKEN)): D
     recallPolicy.channelIds.length +
     recallPolicy.userIds.length +
     recallPolicy.roleIds.length;
-  const recallComplete = Boolean(
-    recallPolicy.guildIds.length &&
-      recallPolicy.channelIds.length &&
-      (recallPolicy.userIds.length || recallPolicy.roleIds.length),
-  );
+  const recallComplete = completeDiscordPolicy(recallPolicy);
   checks.push(
     recallComplete
       ? check('recall-policy', 'Recall authorization', 'pass', `${recallRules} allowlist rule(s) configured`)
@@ -249,21 +263,27 @@ function policyChecks(discordConfigured = Boolean(process.env.DISCORD_TOKEN)): D
   );
 
   const host = process.env.WEB_HOST || '127.0.0.1';
-  const loopback = isLoopbackUrl(`http://${host.includes(':') ? `[${host}]` : host}`);
+  const webIssue = webBindingIssue(
+    host,
+    process.env.WEB_AUTH_TOKEN,
+    process.env.WEB_ALLOWED_HOSTS,
+  );
   checks.push(
-    loopback || process.env.WEB_AUTH_TOKEN
+    !webIssue
       ? check(
           'web-bind',
           'Web access',
           'pass',
-          loopback ? `Bound to loopback (${host})` : 'Remote bind protected by WEB_AUTH_TOKEN',
+          isLoopbackHost(host)
+            ? `Bound to loopback (${host})`
+            : 'Remote bind protected by token and exact Host validation',
         )
       : check(
           'web-bind',
           'Web access',
           'fail',
-          `WEB_HOST=${host} is not loopback and WEB_AUTH_TOKEN is empty`,
-          'Set WEB_AUTH_TOKEN or bind WEB_HOST to 127.0.0.1.',
+          webIssue,
+          'Set WEB_AUTH_TOKEN and exact WEB_ALLOWED_HOSTS, or bind WEB_HOST to 127.0.0.1.',
         ),
   );
 
@@ -295,11 +315,7 @@ async function discordInboxChecks(): Promise<DoctorCheck[]> {
 
   try {
     const policy = config.inboxPolicy;
-    const complete = Boolean(
-      policy.guildIds.length &&
-      policy.channelIds.length &&
-      (policy.userIds.length || policy.roleIds.length),
-    );
+    const complete = completeDiscordPolicy(policy);
     if (!complete) {
       checks.push(check(
         'discord-inbox-policy',
@@ -413,13 +429,16 @@ async function captureStorageCheck(): Promise<DoctorCheck> {
   }
 }
 
-export async function runDoctor(options: { offline?: boolean } = {}): Promise<DoctorReport> {
+export async function runDoctor(
+  options: { offline?: boolean; requireDiscord?: boolean } = {},
+): Promise<DoctorReport> {
   const checks: DoctorCheck[] = [];
   const current = parseNodeVersion(process.version);
+  const recordingConfigured = completeDiscordPolicy(config.recordPolicy);
   checks.push(
-    meetsMinimumVersion(current, [22, 12, 0])
+    meetsMinimumVersion(current, [22, 16, 0])
       ? check('node', 'Node.js', 'pass', process.version)
-      : check('node', 'Node.js', 'fail', `${process.version} is unsupported`, 'Install Node.js 22.12 or newer.'),
+      : check('node', 'Node.js', 'fail', `${process.version} is unsupported`, 'Install Node.js 22.16 or newer.'),
   );
 
   checks.push(
@@ -431,6 +450,7 @@ export async function runDoctor(options: { offline?: boolean } = {}): Promise<Do
       config.parakeetBin,
       ['--help'],
       'Install with: uv tool install parakeet-mlx --with "mlx==0.31.2"',
+      !recordingConfigured,
     ),
     await executableCheck(
       'yt-dlp',
@@ -494,7 +514,7 @@ export async function runDoctor(options: { offline?: boolean } = {}): Promise<Do
               `${index.chunks} chunk(s), generation ${index.indexedGeneration}`,
             ),
   );
-  checks.push(...policyChecks());
+  checks.push(...policyChecks(options.requireDiscord || Boolean(process.env.DISCORD_TOKEN)));
   checks.push(...await discordInboxChecks());
 
   checks.push(
@@ -503,8 +523,10 @@ export async function runDoctor(options: { offline?: boolean } = {}): Promise<Do
       : check(
           'discord-token',
           'Discord token',
-          'warn',
-          'Not configured; CLI and web workflows still work',
+          discordTokenStatus(false, options.requireDiscord === true),
+          options.requireDiscord
+            ? 'Not configured; the Discord bot cannot start'
+            : 'Not configured; CLI and web workflows still work',
           'Set DISCORD_TOKEN to run the Discord bot.',
         ),
   );
@@ -560,7 +582,10 @@ function printReport(report: DoctorReport): void {
 
 async function main(): Promise<void> {
   const args = new Set(process.argv.slice(2));
-  const report = await runDoctor({ offline: args.has('--offline') });
+  const report = await runDoctor({
+    offline: args.has('--offline'),
+    requireDiscord: args.has('--bot'),
+  });
   if (args.has('--json')) console.log(JSON.stringify(report, null, 2));
   else printReport(report);
   if (!report.ready) process.exitCode = 1;

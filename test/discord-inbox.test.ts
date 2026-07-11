@@ -10,7 +10,10 @@ import {
   type DiscordInboxQueue,
 } from '../src/discord-inbox.js';
 import type { ProcessingJob } from '../src/jobs.js';
-import { EncryptedSourceCatalog } from '../src/source-catalog.js';
+import {
+  EncryptedSourceCatalog,
+  type StoredDiscordReceipt,
+} from '../src/source-catalog.js';
 
 const KEY = Buffer.alloc(32, 9).toString('base64');
 const POLICY = {
@@ -82,6 +85,7 @@ test('durable capture precedes one receipt and processing; replay is idempotent'
     catalog,
     queue,
     policy: POLICY,
+    disclosure: 'The source will be sent to the configured remote model.',
     process: async (record) => {
       events.push(`processed:${record.source.id}`);
       return { capability: 'processable', title: 'Captured idea', summary: 'Useful.' };
@@ -100,6 +104,13 @@ test('durable capture precedes one receipt and processing; replay is idempotent'
   assert.equal(replay.status, 'duplicate');
   assert.equal(queue.jobs.length, 1);
   assert.equal(events.filter((event) => event.startsWith('receipt:')).length, 1);
+  const receipts = events.filter((event) => /^(receipt|update):/.test(event));
+  assert.equal(receipts.every((event) => event.includes('encrypted Library storage')), true);
+  assert.equal(receipts.every((event) => !/local only/i.test(event)), true);
+  assert.equal(
+    receipts.every((event) => event.includes('sent to the configured remote model')),
+    true,
+  );
   const stored = await catalog.get(first.sourceId!);
   assert.equal(stored?.recordType, 'source');
   if (stored?.recordType === 'source') {
@@ -111,6 +122,7 @@ test('durable capture precedes one receipt and processing; replay is idempotent'
 test('edits revise and reprocess only an existing capture', async (t) => {
   const catalog = await fixture(t);
   const queue = new ImmediateQueue();
+  let receiptNumber = 0;
   const service = createDiscordInboxService({
     catalog,
     queue,
@@ -119,6 +131,13 @@ test('edits revise and reprocess only an existing capture', async (t) => {
       capability: 'processable',
       summary: record.source.text,
     }),
+    sendReceipt: async () => {
+      receiptNumber += 1;
+      return {
+        identity: { channelId: 'inbox-1', messageId: `receipt-${receiptNumber}` },
+        update: async () => undefined,
+      };
+    },
   });
 
   assert.equal((await service.handleUpdate(message({ id: 'missing' }))).status, 'ignored');
@@ -134,7 +153,75 @@ test('edits revise and reprocess only an existing capture', async (t) => {
   if (stored?.recordType === 'source') {
     assert.equal(stored.source.sourceRevision, 2);
     assert.equal(stored.analysis?.summary, 'Edited useful idea.');
+    assert.deepEqual(stored.save.receipt, {
+      channelId: 'inbox-1',
+      messageId: 'receipt-2',
+      sourceRevision: 2,
+    });
   }
+});
+
+test('a concurrent edit during receipt binding never enqueues the stale revision', async (t) => {
+  const catalog = await fixture(t);
+  const queue = new ImmediateQueue();
+  const staleReceiptUpdates: string[] = [];
+  const currentReceiptUpdates: string[] = [];
+  const processedRevisions: number[] = [];
+  let receiptNumber = 0;
+  let concurrentUpdateStatus: string | undefined;
+  let service!: ReturnType<typeof createDiscordInboxService>;
+  service = createDiscordInboxService({
+    catalog,
+    queue,
+    policy: POLICY,
+    process: async (record) => {
+      processedRevisions.push(record.source.sourceRevision);
+      return { capability: 'processable', summary: record.source.text };
+    },
+    sendReceipt: async () => {
+      receiptNumber += 1;
+      if (receiptNumber === 1) {
+        const updated = await service.handleUpdate(message({
+          content: 'Newer content won the race.',
+          editedAt: '2026-07-10T11:00:00.000Z',
+        }));
+        concurrentUpdateStatus = updated.status;
+        return {
+          identity: { channelId: 'inbox-1', messageId: 'receipt-stale' },
+          update: async (content) => { staleReceiptUpdates.push(content); },
+        };
+      }
+      return {
+        identity: { channelId: 'inbox-1', messageId: 'receipt-current' },
+        update: async (content) => { currentReceiptUpdates.push(content); },
+      };
+    },
+  });
+
+  const created = await service.handleCreate(message());
+  assert.equal(created.status, 'captured');
+  assert.equal(concurrentUpdateStatus, 'revised');
+  assert.equal(receiptNumber, 2);
+  assert.equal(queue.jobs.length, 1);
+  assert.match(queue.jobs[0] ?? '', /:revision:2$/);
+  assert.deepEqual(processedRevisions, [2]);
+  assert.equal(staleReceiptUpdates.length, 1);
+  assert.match(staleReceiptUpdates[0] ?? '', /superseded by a newer Discord edit/i);
+  assert.match(currentReceiptUpdates.at(-1) ?? '', /Processed by Chronicle/);
+
+  const stored = await catalog.get(created.sourceId!);
+  assert.equal(stored?.recordType, 'source');
+  if (stored?.recordType === 'source') {
+    assert.equal(stored.source.sourceRevision, 2);
+    assert.equal(stored.save.processingStatus, 'succeeded');
+    assert.equal(stored.analysis?.summary, 'Newer content won the race.');
+    assert.deepEqual(stored.save.receipt, {
+      channelId: 'inbox-1',
+      messageId: 'receipt-current',
+      sourceRevision: 2,
+    });
+  }
+  await service.close();
 });
 
 test('message deletion cancels work and leaves only a content-free tombstone', async (t) => {
@@ -230,6 +317,9 @@ test('role-only authorization resolves current roles when recovering durable wor
 test('queue admission failures retry automatically with one durable job', async (t) => {
   const catalog = await fixture(t);
   let admissions = 0;
+  const initialReceiptUpdates: string[] = [];
+  const restoredReceiptUpdates: string[] = [];
+  const restoredReceipts: StoredDiscordReceipt[] = [];
   const queue: DiscordInboxQueue = {
     enqueue: async (job) => {
       admissions += 1;
@@ -244,23 +334,109 @@ test('queue admission failures retry automatically with one durable job', async 
     queue,
     policy: POLICY,
     process: async () => ({ capability: 'processable', summary: 'Retried automatically.' }),
+    sendReceipt: async () => ({
+      identity: { channelId: 'inbox-1', messageId: 'receipt-retry' },
+      update: async (content) => { initialReceiptUpdates.push(content); },
+    }),
+    restoreReceipt: (receipt) => {
+      restoredReceipts.push(receipt);
+      return {
+        identity: receipt,
+        update: async (content) => { restoredReceiptUpdates.push(content); },
+      };
+    },
     retryInitialDelayMs: 5,
     retryMaxDelayMs: 10,
   });
 
   const captured = await service.handleCreate(message());
   assert.equal(captured.status, 'waiting');
+  const waiting = await catalog.get(captured.sourceId!);
+  assert.equal(waiting?.recordType, 'source');
+  if (waiting?.recordType === 'source') {
+    assert.deepEqual(waiting.save.receipt, {
+      channelId: 'inbox-1',
+      messageId: 'receipt-retry',
+      sourceRevision: 1,
+    });
+  }
   await waitFor(async () => {
     const stored = await catalog.get(captured.sourceId!);
     return stored?.recordType === 'source' && stored.save.processingStatus === 'succeeded';
   });
+  await waitFor(async () => /Processed by Chronicle/.test(restoredReceiptUpdates.at(-1) ?? ''));
   assert.equal(admissions, 2);
+  assert.match(initialReceiptUpdates.at(-1) ?? '', /waiting for capacity/);
+  assert.deepEqual(restoredReceipts, [{
+    channelId: 'inbox-1',
+    messageId: 'receipt-retry',
+    sourceRevision: 1,
+  }]);
+  assert.equal(restoredReceiptUpdates.some((content) => /processing/.test(content)), true);
+  assert.match(restoredReceiptUpdates.at(-1) ?? '', /Processed by Chronicle/);
   const stored = await catalog.get(captured.sourceId!);
   assert.equal(stored?.recordType, 'source');
   if (stored?.recordType === 'source') {
     assert.equal(stored.analysis?.summary, 'Retried automatically.');
   }
   await service.close();
+});
+
+test('restart recovery edits the original durable receipt through a restored adapter', async (t) => {
+  const catalog = await fixture(t);
+  const initialReceiptUpdates: string[] = [];
+  const unavailableQueue: DiscordInboxQueue = {
+    enqueue: async () => { throw new Error('Processing queue is full.'); },
+    cancel: () => false,
+  };
+  const initial = createDiscordInboxService({
+    catalog,
+    queue: unavailableQueue,
+    policy: POLICY,
+    process: async () => ({ capability: 'processable' }),
+    sendReceipt: async () => ({
+      identity: { channelId: 'inbox-1', messageId: 'receipt-before-restart' },
+      update: async (content) => { initialReceiptUpdates.push(content); },
+    }),
+    retryInitialDelayMs: 10_000,
+  });
+
+  const captured = await initial.handleCreate(message());
+  assert.equal(captured.status, 'waiting');
+  assert.match(initialReceiptUpdates.at(-1) ?? '', /waiting for capacity/);
+  await initial.close();
+
+  const restoredReceipts: StoredDiscordReceipt[] = [];
+  const restoredReceiptUpdates: string[] = [];
+  const recovering = createDiscordInboxService({
+    catalog,
+    queue: new ImmediateQueue(),
+    policy: POLICY,
+    process: async () => ({ capability: 'processable', summary: 'Recovered after restart.' }),
+    restoreReceipt: (receipt) => {
+      restoredReceipts.push(receipt);
+      return {
+        identity: receipt,
+        update: async (content) => { restoredReceiptUpdates.push(content); },
+      };
+    },
+  });
+
+  assert.equal(await recovering.recover(), 1);
+  assert.deepEqual(restoredReceipts, [{
+    channelId: 'inbox-1',
+    messageId: 'receipt-before-restart',
+    sourceRevision: 1,
+  }]);
+  assert.equal(restoredReceiptUpdates.some((content) => /processing/.test(content)), true);
+  assert.match(restoredReceiptUpdates.at(-1) ?? '', /Processed by Chronicle/);
+  const stored = await catalog.get(captured.sourceId!);
+  assert.equal(stored?.recordType, 'source');
+  if (stored?.recordType === 'source') {
+    assert.equal(stored.save.processingStatus, 'succeeded');
+    assert.equal(stored.analysis?.summary, 'Recovered after restart.');
+  }
+  await recovering.close();
 });
 
 test('exhausted processing failures remain durable and retry automatically', async (t) => {

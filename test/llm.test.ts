@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { completeJson, extractJson, validateJsonSchema } from '../src/llm.js';
+import { completeJson, completeText, extractJson, validateJsonSchema } from '../src/llm.js';
 
 const schema = {
   type: 'object',
@@ -60,6 +60,33 @@ test('completeJson retries invalid local structured output once with correction 
     assert.equal(requests.length, 2);
     assert.equal(requests[0].temperature, 0);
     assert.match(requests[1].messages?.at(-1)?.content ?? '', /failed validation/i);
+  } finally {
+    globalThis.fetch = originalFetch;
+    if (previousProvider === undefined) delete process.env.LLM_PROVIDER;
+    else process.env.LLM_PROVIDER = previousProvider;
+    if (previousBaseUrl === undefined) delete process.env.LLM_BASE_URL;
+    else process.env.LLM_BASE_URL = previousBaseUrl;
+  }
+});
+
+test('completeText makes local recall deterministic', async () => {
+  const originalFetch = globalThis.fetch;
+  const previousProvider = process.env.LLM_PROVIDER;
+  const previousBaseUrl = process.env.LLM_BASE_URL;
+  process.env.LLM_PROVIDER = 'local';
+  process.env.LLM_BASE_URL = 'http://127.0.0.1:11434/v1';
+  let request: { temperature?: number } | undefined;
+  globalThis.fetch = async (_input, init) => {
+    request = JSON.parse(String(init?.body));
+    return Response.json({ choices: [{ message: { content: 'Grounded answer.' } }] });
+  };
+
+  try {
+    assert.equal(
+      await completeText({ system: 'Use evidence.', user: 'Answer the question.' }),
+      'Grounded answer.',
+    );
+    assert.equal(request?.temperature, 0);
   } finally {
     globalThis.fetch = originalFetch;
     if (previousProvider === undefined) delete process.env.LLM_PROVIDER;

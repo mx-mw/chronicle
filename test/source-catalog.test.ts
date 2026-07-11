@@ -31,6 +31,7 @@ function message(id: string, text = `message ${id}`): CaptureDiscordMessageInput
         filename: 'reference.png',
         contentType: 'image/png',
         sizeBytes: 120,
+        durationSeconds: 7.25,
         url: 'https://cdn.discordapp.com/attachments/channel/file/reference.png?ex=secret&is=secret',
       },
     ],
@@ -59,10 +60,25 @@ test('records are AES-256-GCM ciphertext at rest with private permissions', asyn
     record.source.attachments[0]?.url,
     'https://cdn.discordapp.com/attachments/channel/file/reference.png',
   );
+  assert.equal(record.source.attachments[0]?.durationSeconds, 7.25);
+  await catalog.update(
+    record.source.id,
+    {
+      receipt: {
+        channelId: 'inbox-1',
+        messageId: 'receipt-secret',
+        sourceRevision: 1,
+      },
+    },
+    { expectedSourceRevision: 1 },
+  );
 
   const [filename] = await readdir(path.join(root, 'records'));
   const raw = await readFile(path.join(root, 'records', filename), 'utf8');
-  assert.doesNotMatch(raw, /plaintext secret|message-secret|Ethan Wu|cdn\.discordapp/);
+  assert.doesNotMatch(
+    raw,
+    /plaintext secret|message-secret|receipt-secret|Ethan Wu|cdn\.discordapp/,
+  );
   const envelope = JSON.parse(raw) as Record<string, unknown>;
   assert.equal(envelope.algorithm, 'aes-256-gcm');
   assert.equal(typeof envelope.ciphertext, 'string');
@@ -73,6 +89,19 @@ test('records are AES-256-GCM ciphertext at rest with private permissions', asyn
     assert.equal((await stat(path.join(root, 'records'))).mode & 0o777, 0o700);
     assert.equal((await stat(path.join(root, 'records', filename))).mode & 0o777, 0o600);
   }
+});
+
+test('legacy source records without receipt metadata remain readable', async (t) => {
+  const root = await fixture(t);
+  const legacyCatalog = new EncryptedSourceCatalog({ directory: root, encryptionKey: KEY });
+  const created = asRecord(
+    (await legacyCatalog.captureDiscordMessage(message('message-before-receipts'))).entry,
+  );
+  assert.equal(created.save.receipt, undefined);
+
+  const upgradedCatalog = new EncryptedSourceCatalog({ directory: root, encryptionKey: KEY });
+  const restored = asRecord(await upgradedCatalog.get(created.source.id));
+  assert.equal(restored.save.receipt, undefined);
 });
 
 test('Discord media signatures are removed from stored URLs and message text only', async (t) => {
@@ -117,6 +146,7 @@ test('exact Discord replay is idempotent and an edit creates a reset revision', 
     processingStatus: 'succeeded',
     reviewStatus: 'needs_review',
     analysis: { capability: 'processable', summary: 'Old analysis' },
+    receipt: { channelId: 'inbox-1', messageId: 'receipt-revision-1', sourceRevision: 1 },
   });
   const editedInput = message('message-1', 'edited content');
   editedInput.messageEditedAt = '2026-07-10T10:00:00.000Z';
@@ -127,7 +157,38 @@ test('exact Discord replay is idempotent and an edit creates a reset revision', 
   assert.equal(editedRecord.source.status, 'edited');
   assert.equal(editedRecord.save.processingStatus, 'queued');
   assert.equal(editedRecord.save.reviewStatus, 'not_generated');
+  assert.equal(editedRecord.save.receipt, undefined);
   assert.equal(editedRecord.analysis, undefined);
+  await assert.rejects(
+    catalog.update(
+      id,
+      {
+        receipt: {
+          channelId: 'inbox-1',
+          messageId: 'stale-receipt',
+          sourceRevision: 1,
+        },
+      },
+      { expectedSourceRevision: 1 },
+    ),
+    SourceRevisionConflictError,
+  );
+  const rebound = await catalog.update(
+    id,
+    {
+      receipt: {
+        channelId: 'inbox-1',
+        messageId: 'receipt-revision-2',
+        sourceRevision: 2,
+      },
+    },
+    { expectedSourceRevision: 2 },
+  );
+  assert.deepEqual(rebound.save.receipt, {
+    channelId: 'inbox-1',
+    messageId: 'receipt-revision-2',
+    sourceRevision: 2,
+  });
   assert.equal((await readdir(path.join(root, 'records'))).length, 1);
 });
 

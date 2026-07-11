@@ -7,6 +7,7 @@ import {
   MessageType,
   Options,
   Partials,
+  Routes,
   SlashCommandBuilder,
   type GuildMember,
   type Message,
@@ -19,14 +20,25 @@ import { access } from 'node:fs/promises';
 import path from 'node:path';
 import { config } from './config.js';
 import {
+  discordAttachmentInput,
+  discordRecallPresentation,
+  publishConsentNotice,
+} from './discord-adapters.js';
+import {
   createDiscordInboxService,
   type DiscordInboxMessage,
 } from './discord-inbox.js';
+import { assertConfiguredRecordingReady } from './discord-startup.js';
 import { extractInboxUrls, processInboxSource } from './inbox-processing.js';
 import { ProcessingCancelledError, ProcessingQueue } from './jobs.js';
 import { readDraft, rejectDraft, tombstoneOperation } from './kb.js';
 import { describeProvider } from './llm.js';
-import { authorize, explainDenial, type AuthorizationContext } from './policy.js';
+import {
+  authorize,
+  completeDiscordPolicy,
+  explainDenial,
+  type AuthorizationContext,
+} from './policy.js';
 import {
   processMeeting,
   reconcileDiscardedSessions,
@@ -866,11 +878,7 @@ function requireCompleteInboxPolicy(): void {
       'Discord Inbox requires DISCORD_MESSAGE_CONTENT_ENABLED=true after enabling the intent in Discord Developer Portal.',
     );
   }
-  if (
-    policy.guildIds.length === 0 ||
-    policy.channelIds.length === 0 ||
-    (policy.userIds.length === 0 && policy.roleIds.length === 0)
-  ) {
+  if (!completeDiscordPolicy(policy)) {
     throw new Error(
       'Discord Inbox requires exact INBOX_GUILD_IDS and INBOX_CHANNEL_IDS plus an INBOX_USER_IDS or INBOX_ROLE_IDS identity rule.',
     );
@@ -880,15 +888,7 @@ function requireCompleteInboxPolicy(): void {
 function discordInboxMessage(message: Message): DiscordInboxMessage | undefined {
   if (!message.inGuild()) return undefined;
   const member = message.member;
-  const attachments = [...message.attachments.values()].map((attachment) => ({
-    id: attachment.id,
-    filename: attachment.name,
-    url: attachment.url,
-    contentType: attachment.contentType ?? undefined,
-    sizeBytes: attachment.size,
-    width: attachment.width ?? undefined,
-    height: attachment.height ?? undefined,
-  }));
+  const attachments = [...message.attachments.values()].map(discordAttachmentInput);
   return {
     id: message.id,
     guildId: message.guildId,
@@ -918,6 +918,7 @@ function discordInboxMessage(message: Message): DiscordInboxMessage | undefined 
         allowedMentions: { parse: [], repliedUser: false },
       });
       return {
+        identity: { channelId: receipt.channelId, messageId: receipt.id },
         update: async (next) => {
           await receipt.edit({ content: next, allowedMentions: { parse: [] } });
         },
@@ -970,6 +971,17 @@ if (config.discordInboxEnabled) {
     queue: processingQueue,
     policy: config.inboxPolicy,
     process: processDiscordInboxRecord,
+    restoreReceipt: ({ channelId, messageId }) => ({
+      identity: { channelId, messageId },
+      update: async (content) => {
+        await client.rest.patch(Routes.channelMessage(channelId, messageId), {
+          body: {
+            content,
+            allowed_mentions: { parse: [] },
+          },
+        });
+      },
+    }),
     resolveCurrentRoleIds: async (guildId, userId) => {
       const guild =
         client.guilds.cache.get(guildId) ??
@@ -1229,14 +1241,18 @@ async function handleRecordStart(interaction: ChatInputCommandInteraction): Prom
   if (!(await requireRecordAuthorization(interaction, member, channel.id))) return;
 
   await interaction.deferReply({ ephemeral: true });
-  const session = await startAfterConsent(channel, async (notice) => {
+  const session = await startAfterConsent(channel, (notice) => {
     // The voice room's own text surface is the consent channel of record; a
     // slash-command acknowledgement somewhere else is not enough for everyone
     // whose audio would be captured.
-    await (channel as unknown as SendableChannels).send(notice);
-    await interaction.editReply(
-      `Consent notice posted in ${channel.name}; capture waits the configured grace period.`,
-    );
+    return publishConsentNotice({
+      notice,
+      send: (content) => (channel as unknown as SendableChannels).send(content),
+      acknowledge: () =>
+        interaction.editReply(
+          `Consent notice posted in ${channel.name}; capture waits the configured grace period.`,
+        ),
+    });
   });
   if (!session) {
     await interaction.editReply('Recording start was cancelled before capture.');
@@ -1623,17 +1639,20 @@ async function handleRecall(interaction: ChatInputCommandInteraction): Promise<v
   const query = interaction.options.getString('query', true);
   await interaction.deferReply({ ephemeral: true });
 
-  const { answer, hits } = await recall(query, 8, { workspaceId: interaction.guildId! });
-  if (hits.length === 0) {
-    await interaction.editReply(`Nothing in this server's knowledge workspace is relevant to “${query}”.`);
+  const result = await recall(query, 8, { workspaceId: interaction.guildId! });
+  const presentation = discordRecallPresentation(query, result);
+  if (presentation.kind === 'insufficient') {
+    await interaction.editReply({
+      content: presentation.message,
+      allowedMentions: { parse: [] },
+    });
     return;
   }
 
-  const sources = [...new Set(hits.map((hit) => hit.file.replace(/\.md$/, '')))];
   const embed = new EmbedBuilder()
-    .setTitle(`🔎 ${query}`.slice(0, 256))
-    .setDescription(answer.slice(0, 4000))
-    .setFooter({ text: `Sources: ${sources.join(' · ')}`.slice(0, 2048) });
+    .setTitle(presentation.title)
+    .setDescription(presentation.description)
+    .setFooter({ text: presentation.footer });
   await interaction.editReply({ embeds: [embed] });
 }
 
@@ -1726,5 +1745,5 @@ async function gracefulShutdown(signal: NodeJS.Signals): Promise<void> {
 process.once('SIGINT', () => void gracefulShutdown('SIGINT'));
 process.once('SIGTERM', () => void gracefulShutdown('SIGTERM'));
 
-await assertParakeetReady();
+await assertConfiguredRecordingReady(config.recordPolicy, assertParakeetReady);
 await client.login(config.discordToken);

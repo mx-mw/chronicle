@@ -1384,7 +1384,9 @@ select {
     min-height: 4.35rem;
     padding: 0.42rem;
     display: grid;
-    grid-template-columns: repeat(4, 1fr);
+    grid-template-columns: repeat(5, minmax(0, 1fr));
+    grid-auto-flow: column;
+    grid-auto-rows: 1fr;
     gap: 0.25rem;
     border-radius: 1.4rem;
     background: color-mix(in srgb, var(--panel) 90%, transparent);

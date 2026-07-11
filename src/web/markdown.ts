@@ -9,14 +9,32 @@ export interface Frontmatter {
   type?: string;
 }
 
-const FRONTMATTER_RE = /^---\n([\s\S]*?)\n---\n?/;
+const FRONTMATTER_RE = /^---\r?\n([\s\S]*?)\r?\n---(?:\r?\n|$)/;
+
+function decodeFrontmatterScalar(raw: string | undefined): string | undefined {
+  if (raw === undefined) return undefined;
+  const value = raw.trim();
+  if (value.startsWith('"') && value.endsWith('"')) {
+    try {
+      const parsed: unknown = JSON.parse(value);
+      return typeof parsed === 'string' ? parsed : value;
+    } catch {
+      return value.slice(1, -1);
+    }
+  }
+  if (value.startsWith("'") && value.endsWith("'")) {
+    return value.slice(1, -1).replace(/''/g, "'");
+  }
+  return value;
+}
 
 export function parseFrontmatter(content: string): { meta: Frontmatter; body: string } {
   const match = content.match(FRONTMATTER_RE);
   if (!match) return { meta: {}, body: content };
   const block = match[1];
-  const get = (key: string) =>
-    block.match(new RegExp(`^${key}:\\s*(.+)$`, 'm'))?.[1]?.trim();
+  const get = (key: string) => decodeFrontmatterScalar(
+    block.match(new RegExp(`^${key}:\\s*(.*)$`, 'm'))?.[1],
+  );
   return {
     meta: { name: get('name'), description: get('description'), type: get('type') },
     body: content.slice(match[0].length),
@@ -100,7 +118,10 @@ function renderInlineNonCode(escaped: string): string {
 /** Render the KB subset: h1-h3, bullet lists (incl. task checkboxes), bold, inline code, links, wiki-links, fenced code. */
 export function renderMarkdown(markdown: string): string {
   const { body } = parseFrontmatter(markdown);
-  const lines = body.replace(/\r\n/g, '\n').split('\n');
+  const lines = body
+    .replace(/[ \t]*<!--\s*chronicle-fact:[\s\S]*?-->[ \t]*/gi, '')
+    .replace(/\r\n/g, '\n')
+    .split('\n');
   const html: string[] = [];
 
   let i = 0;
@@ -135,6 +156,17 @@ export function renderMarkdown(markdown: string): string {
       const level = heading[1].length;
       html.push(`<h${level}>${renderInline(escapeHtml(heading[2].trim()))}</h${level}>`);
       i += 1;
+      continue;
+    }
+
+    if (/^\s*>/.test(line)) {
+      flushParagraph();
+      const quote: string[] = [];
+      while (i < lines.length && /^\s*>/.test(lines[i])) {
+        quote.push(lines[i].replace(/^\s*>\s?/, ''));
+        i += 1;
+      }
+      html.push(`<blockquote>${renderMarkdown(quote.join('\n'))}</blockquote>`);
       continue;
     }
 

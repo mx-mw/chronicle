@@ -5,7 +5,6 @@ import { createHash, randomUUID, timingSafeEqual } from 'node:crypto';
 import { constants, existsSync } from 'node:fs';
 import { access, readFile, realpath } from 'node:fs/promises';
 import { createServer, type IncomingMessage, type ServerResponse } from 'node:http';
-import { isIP } from 'node:net';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { config } from '../config.js';
@@ -20,9 +19,11 @@ import {
   type SourceMeta,
 } from '../kb.js';
 import { describeProvider } from '../llm.js';
+import { completeDiscordPolicy } from '../policy.js';
 import { reconcileDiscardedSessions } from '../pipeline.js';
 import { recall } from '../recall.js';
 import { localDate } from '../reporting.js';
+import { isLoopbackHost as runtimeIsLoopbackHost } from '../runtime.js';
 import { extract, type ExtractedSource, type SourceKind } from '../sources/index.js';
 import { getIndexHealth, search } from '../store.js';
 import {
@@ -243,15 +244,7 @@ function normaliseHostname(host: string): string {
 }
 
 export function isLoopbackHost(host: string): boolean {
-  const value = normaliseHostname(host);
-  if (value === 'localhost' || value === '::1') return true;
-  const version = isIP(value);
-  if (version === 4) return Number(value.split('.')[0]) === 127;
-  if (version === 6) {
-    const mapped = value.match(/^::ffff:(\d{1,3}(?:\.\d{1,3}){3})$/i)?.[1];
-    return mapped ? isIP(mapped) === 4 && Number(mapped.split('.')[0]) === 127 : false;
-  }
-  return false;
+  return runtimeIsLoopbackHost(host);
 }
 
 function hostnameFromHeader(hostHeader: string | undefined): string | null {
@@ -296,18 +289,26 @@ export function mutationRequestAllowed(
   }
 }
 
-export function isTrustedHostHeader(hostHeader: string | undefined, bindHost = HOST): boolean {
-  const requestHost = hostnameFromHeader(hostHeader);
-  if (!requestHost) return false;
-  if (isLoopbackHost(bindHost)) return isLoopbackHost(requestHost);
-
-  const configured = (process.env.WEB_ALLOWED_HOSTS || '')
+function allowedWebHosts(bindHost: string, configuredHosts: string): string[] {
+  const configured = configuredHosts
     .split(',')
     .map(normaliseHostname)
     .filter(Boolean);
   const bound = normaliseHostname(bindHost);
   if (bound !== '0.0.0.0' && bound !== '::') configured.push(bound);
-  return configured.length === 0 || configured.includes(requestHost);
+  return [...new Set(configured)];
+}
+
+export function isTrustedHostHeader(
+  hostHeader: string | undefined,
+  bindHost = HOST,
+  configuredHosts = process.env.WEB_ALLOWED_HOSTS || '',
+): boolean {
+  const requestHost = hostnameFromHeader(hostHeader);
+  if (!requestHost) return false;
+  if (isLoopbackHost(bindHost)) return isLoopbackHost(requestHost);
+
+  return allowedWebHosts(bindHost, configuredHosts).includes(requestHost);
 }
 
 export function authorizationMatches(header: string | undefined, token = AUTH_TOKEN): boolean {
@@ -327,9 +328,18 @@ export function authorizationMatches(header: string | undefined, token = AUTH_TO
   }
 }
 
-export function validateWebBinding(host = HOST, token = AUTH_TOKEN): void {
+export function validateWebBinding(
+  host = HOST,
+  token = AUTH_TOKEN,
+  configuredHosts = process.env.WEB_ALLOWED_HOSTS || '',
+): void {
   if (!isLoopbackHost(host) && !token) {
     throw new Error('WEB_AUTH_TOKEN is required when WEB_HOST is not loopback.');
+  }
+  if (!isLoopbackHost(host) && allowedWebHosts(host, configuredHosts).length === 0) {
+    throw new Error(
+      'WEB_ALLOWED_HOSTS must name at least one exact host when WEB_HOST uses an unspecified address.',
+    );
   }
 }
 
@@ -814,18 +824,7 @@ async function pathAccess(target: string): Promise<{ exists: boolean; readable: 
   return { exists: true, readable, writable };
 }
 
-export function completeDiscordPolicy(policy: {
-  guildIds: readonly string[];
-  channelIds: readonly string[];
-  userIds: readonly string[];
-  roleIds: readonly string[];
-}): boolean {
-  return Boolean(
-    policy.guildIds.length &&
-      policy.channelIds.length &&
-      (policy.userIds.length || policy.roleIds.length),
-  );
-}
+export { completeDiscordPolicy } from '../policy.js';
 
 async function buildTrustHealth(workspaceId: string): Promise<Record<string, unknown>> {
   const [storage, api, locatedSessions] = await Promise.all([
@@ -838,6 +837,7 @@ async function buildTrustHealth(workspaceId: string): Promise<Record<string, unk
   const review = reviewApiReady(api);
   const recordPolicyConfigured = completeDiscordPolicy(config.recordPolicy);
   const recallPolicyConfigured = completeDiscordPolicy(config.recallPolicy);
+  const discordTokenConfigured = Boolean(process.env.DISCORD_TOKEN?.trim());
   const issues: string[] = [];
   if (!storage.exists) issues.push('Knowledge base has not been created.');
   else if (!storage.readable || !storage.writable) issues.push('Knowledge base permissions need attention.');
@@ -848,6 +848,12 @@ async function buildTrustHealth(workspaceId: string): Promise<Record<string, unk
   if (!review) issues.push('Review workflow is not available.');
   if (!recordPolicyConfigured) issues.push('Recording policy is not configured.');
   if (!recallPolicyConfigured) issues.push('Recall policy is not configured.');
+  if (
+    (recordPolicyConfigured || recallPolicyConfigured || config.discordInboxEnabled) &&
+    !discordTokenConfigured
+  ) {
+    issues.push('Discord bot token is not configured, so Discord features cannot be online.');
+  }
   const sessions = locatedSessions
     .map(({ manifest }) => manifest)
     .filter((manifest) => manifest.workspace.id === workspaceId)
@@ -891,6 +897,7 @@ async function buildTrustHealth(workspaceId: string): Promise<Record<string, unk
       bindScope: isLoopbackHost(HOST) ? 'loopback' : 'remote',
       authRequired: !isLoopbackHost(HOST),
       authEnabled: Boolean(AUTH_TOKEN),
+      discordTokenConfigured,
       provider: config.llmProvider,
       providerLabel: describeProvider(),
     },

@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
-import { authorize, type AccessPolicy } from '../src/policy.js';
+import { authorize, completeDiscordPolicy, type AccessPolicy } from '../src/policy.js';
 import {
   admitParticipantAfterNotice,
   modelProcessingNotice,
@@ -21,6 +21,21 @@ test('an empty policy fails closed', () => {
   assert.deepEqual(
     authorize({ guildIds: [], channelIds: [], userIds: [], roleIds: [] }, context),
     { allowed: false, reason: 'guild_not_allowed' },
+  );
+});
+
+test('a complete Discord policy requires location and identity rules', () => {
+  assert.equal(
+    completeDiscordPolicy({ guildIds: ['guild-a'], channelIds: ['channel-a'], userIds: ['user-a'], roleIds: [] }),
+    true,
+  );
+  assert.equal(
+    completeDiscordPolicy({ guildIds: ['guild-a'], channelIds: [], userIds: ['user-a'], roleIds: [] }),
+    false,
+  );
+  assert.equal(
+    completeDiscordPolicy({ guildIds: ['guild-a'], channelIds: ['channel-a'], userIds: [], roleIds: [] }),
+    false,
   );
 });
 

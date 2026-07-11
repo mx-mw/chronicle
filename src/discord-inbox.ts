@@ -8,6 +8,7 @@ import {
   type DiscordMessageIdentity,
   type SourceAnalysis,
   type SourceCatalogRecord,
+  type StoredDiscordReceipt,
 } from './source-catalog.js';
 
 export interface DiscordInboxMessage {
@@ -34,6 +35,11 @@ export interface DiscordInboxMessage {
 }
 
 export interface DiscordInboxReceipt {
+  /** Durable identity only; the update function itself is never persisted. */
+  identity?: {
+    channelId: string;
+    messageId: string;
+  };
   update: (content: string) => Promise<void>;
 }
 
@@ -51,6 +57,8 @@ export interface DiscordInboxServiceOptions {
     message: DiscordInboxMessage,
     initialContent: string,
   ) => Promise<DiscordInboxReceipt | undefined>;
+  /** Rebuilds an update adapter for a receipt after a queue retry or restart. */
+  restoreReceipt?: (receipt: StoredDiscordReceipt) => DiscordInboxReceipt | undefined;
   disclosure?: string;
   resolveCurrentRoleIds?: (
     guildId: string,
@@ -68,6 +76,10 @@ export interface DiscordInboxCaptureResult {
   status: 'ignored' | 'duplicate' | 'captured' | 'revised' | 'waiting' | 'failed';
   sourceId?: string;
 }
+
+type DiscordInboxReceiptBinding =
+  | { status: 'ready'; record: SourceCatalogRecord }
+  | { status: 'superseded' };
 
 function isAcceptedMessageType(type: DiscordInboxMessage['type']): boolean {
   return type === 'default' || type === 'reply';
@@ -101,6 +113,10 @@ function processingJobId(record: SourceCatalogRecord): string {
 function compactDisclosure(value: string | undefined): string {
   const cleaned = value?.replace(/\s+/g, ' ').trim();
   return cleaned ? ` ${cleaned}` : '';
+}
+
+function libraryReceipt(status: string, disclosure: string): string {
+  return `${status} | encrypted Library storage.${disclosure}`;
 }
 
 function captureInput(
@@ -217,6 +233,48 @@ export function createDiscordInboxService(options: DiscordInboxServiceOptions) {
     return options.sendReceipt?.(message, content).catch(() => undefined);
   }
 
+  async function bindReceipt(
+    record: SourceCatalogRecord,
+    receipt: DiscordInboxReceipt | undefined,
+  ): Promise<DiscordInboxReceiptBinding> {
+    if (!receipt?.identity) return { status: 'ready', record };
+    try {
+      return {
+        status: 'ready',
+        record: await options.catalog.update(
+          record.source.id,
+          {
+            receipt: {
+              channelId: receipt.identity.channelId,
+              messageId: receipt.identity.messageId,
+              sourceRevision: record.source.sourceRevision,
+            },
+          },
+          { expectedSourceRevision: record.source.sourceRevision },
+        ),
+      };
+    } catch (error) {
+      // A concurrent Discord edit owns the newer receipt and processing job.
+      if (error instanceof SourceRevisionConflictError) {
+        await updateReceipt(
+          receipt,
+          libraryReceipt('Superseded by a newer Discord edit', disclosure),
+        );
+        return { status: 'superseded' };
+      }
+      throw error;
+    }
+  }
+
+  function restoreStoredReceipt(record: SourceCatalogRecord): DiscordInboxReceipt | undefined {
+    if (!record.save.receipt || !options.restoreReceipt) return undefined;
+    try {
+      return options.restoreReceipt({ ...record.save.receipt });
+    } catch {
+      return undefined;
+    }
+  }
+
   async function enqueueRecord(
     record: SourceCatalogRecord,
     receipt: DiscordInboxReceipt | undefined,
@@ -234,7 +292,7 @@ export function createDiscordInboxService(options: DiscordInboxServiceOptions) {
             { processingStatus: 'processing' },
             { expectedSourceRevision },
           );
-          await updateReceipt(receipt, `Saved to Chronicle | processing | local only.${disclosure}`);
+          await updateReceipt(receipt, libraryReceipt('Saved to Chronicle | processing', disclosure));
         },
         run: async (signal) => {
           const current = await options.catalog.get(sourceId);
@@ -269,7 +327,10 @@ export function createDiscordInboxService(options: DiscordInboxServiceOptions) {
       const partial = current.save.processingStatus === 'partial';
       await updateReceipt(
         receipt,
-        `${partial ? 'Saved with limited processing' : 'Processed by Chronicle'} | Library | local only.${disclosure}`,
+        libraryReceipt(
+          partial ? 'Saved with limited processing' : 'Processed by Chronicle',
+          disclosure,
+        ),
       );
       resetRetryBackoff();
       return 'captured';
@@ -281,7 +342,10 @@ export function createDiscordInboxService(options: DiscordInboxServiceOptions) {
         current.source.sourceRevision === expectedSourceRevision &&
         current.save.processingStatus === 'queued'
       ) {
-        await updateReceipt(receipt, `Saved to Chronicle | waiting for capacity | local only.${disclosure}`);
+        await updateReceipt(
+          receipt,
+          libraryReceipt('Saved to Chronicle | waiting for capacity', disclosure),
+        );
         scheduleRetry();
         return 'waiting';
       }
@@ -298,12 +362,18 @@ export function createDiscordInboxService(options: DiscordInboxServiceOptions) {
           scheduleRetry();
           await updateReceipt(
             receipt,
-            `Saved to Chronicle | processing failed | retrying automatically.${disclosure}`,
+            libraryReceipt(
+              'Saved to Chronicle | processing failed; retrying automatically',
+              disclosure,
+            ),
           );
           return 'failed';
         }
       }
-      await updateReceipt(receipt, `Saved to Chronicle | processing stopped.${disclosure}`);
+      await updateReceipt(
+        receipt,
+        libraryReceipt('Saved to Chronicle | processing stopped', disclosure),
+      );
       return 'failed';
     }
   }
@@ -330,9 +400,16 @@ export function createDiscordInboxService(options: DiscordInboxServiceOptions) {
     }
     const receipt = await sendMessageReceipt(
       message,
-      `Saved to Chronicle | queued | local only.${disclosure}`,
+      libraryReceipt('Saved to Chronicle | queued', disclosure),
     );
-    const result = await enqueueRecord(captured.entry, receipt, acquisitionWarnings);
+    const binding = await bindReceipt(captured.entry, receipt);
+    if (binding.status === 'superseded') {
+      return {
+        status: captured.outcome === 'revised' ? 'revised' : 'captured',
+        sourceId: captured.entry.source.id,
+      };
+    }
+    const result = await enqueueRecord(binding.record, receipt, acquisitionWarnings);
     return {
       status: result === 'captured'
         ? captured.outcome === 'revised' ? 'revised' : 'captured'
@@ -357,9 +434,13 @@ export function createDiscordInboxService(options: DiscordInboxServiceOptions) {
     options.queue.cancel(processingJobId(existing), 'Discord source was edited.');
     const receipt = await sendMessageReceipt(
       message,
-      `Updated Chronicle source | queued | local only.${disclosure}`,
+      libraryReceipt('Updated Chronicle source | queued', disclosure),
     );
-    const result = await enqueueRecord(captured.entry, receipt, acquisitionWarnings);
+    const binding = await bindReceipt(captured.entry, receipt);
+    if (binding.status === 'superseded') {
+      return { status: 'revised', sourceId: captured.entry.source.id };
+    }
+    const result = await enqueueRecord(binding.record, receipt, acquisitionWarnings);
     return {
       status: result === 'captured' ? 'revised' : result,
       sourceId: captured.entry.source.id,
@@ -405,7 +486,7 @@ export function createDiscordInboxService(options: DiscordInboxServiceOptions) {
           { processingStatus: 'queued' },
           { expectedSourceRevision: current.source.sourceRevision },
         );
-        await enqueueRecord(queued, undefined, []);
+        await enqueueRecord(queued, restoreStoredReceipt(queued), []);
         recovered += 1;
       } catch (error) {
         if (error instanceof SourceRevisionConflictError) continue;

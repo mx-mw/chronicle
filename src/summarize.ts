@@ -183,6 +183,117 @@ function materialTokens(value: string): Set<string> {
   );
 }
 
+const GENERIC_TOPIC_TERMS = new Set([
+  ...CLAIM_STOP_WORDS,
+  'app', 'application', 'detail', 'details', 'information', 'meeting', 'meetings', 'note',
+  'notes', 'product', 'products', 'project', 'projects', 'service', 'services', 'system',
+  'systems', 'team', 'teams', 'topic', 'topics', 'work', 'working',
+]);
+
+function lexicalTokens(value: string): Set<string> {
+  return new Set(
+    normalizedKey(value)
+      .replace(/[^\p{L}\p{N}]+/gu, ' ')
+      .split(/\s+/)
+      .filter(Boolean),
+  );
+}
+
+function sourceWords(value: string): string[] {
+  return value.normalize('NFKC').match(/[\p{L}\p{N}]+/gu) ?? [];
+}
+
+function identifierTokens(value: string): Set<string> {
+  return new Set(
+    sourceWords(value)
+      .filter((word) => {
+        if (/\p{N}/u.test(word)) return true;
+        const letters = word.replace(/[^\p{L}]/gu, '');
+        return letters.length >= 2 && (
+          letters === letters.toLocaleUpperCase('en-US') ||
+          /\p{Lu}/u.test(letters.slice(1))
+        );
+      })
+      .map(normalizedKey),
+  );
+}
+
+function topicIdentity(value: string): string {
+  return normalizedKey(value).replace(/[^\p{L}\p{N}]+/gu, '-').replace(/^-|-$/g, '');
+}
+
+function distinctiveCatalogTokens(value: string): Set<string> {
+  return new Set(
+    [...lexicalTokens(value)].filter(
+      (token) => token.length >= 2 && !GENERIC_TOPIC_TERMS.has(token),
+    ),
+  );
+}
+
+function topicDistinctiveTokens(topic: KnownTopic): Set<string> {
+  return new Set([
+    ...distinctiveCatalogTokens(topic.slug),
+    ...distinctiveCatalogTokens(topic.title),
+  ]);
+}
+
+function catalogReferenceTokens(
+  topics: KnownTopic[] | undefined,
+  includeDescriptionTerms: boolean,
+): Set<string> {
+  const tokens = new Set<string>();
+  for (const topic of topics ?? []) {
+    for (const token of topicDistinctiveTokens(topic)) tokens.add(token);
+    const description = topic.description ?? '';
+    if (includeDescriptionTerms) {
+      for (const token of distinctiveCatalogTokens(description)) tokens.add(token);
+      continue;
+    }
+    for (const token of identifierTokens(description)) tokens.add(token);
+    for (const word of sourceWords(description)) {
+      const normalized = normalizedKey(word);
+      if (
+        /^\p{Lu}[\p{Ll}\p{M}]+$/u.test(word) &&
+        !GENERIC_TOPIC_TERMS.has(normalized)
+      ) {
+        tokens.add(normalized);
+      }
+    }
+  }
+  return tokens;
+}
+
+/** Catalog labels are classification hints, never evidence for a claim. */
+function claimReferencesSupported(
+  claim: string,
+  evidenceQuotes: string[],
+  topics: KnownTopic[] | undefined,
+  includeDescriptionTerms = true,
+): boolean {
+  const evidenceTokens = lexicalTokens(evidenceQuotes.join(' '));
+  for (const identifier of identifierTokens(claim)) {
+    if (!evidenceTokens.has(identifier)) return false;
+  }
+  const catalogTokens = catalogReferenceTokens(topics, includeDescriptionTerms);
+  for (const token of lexicalTokens(claim)) {
+    if (catalogTokens.has(token) && !evidenceTokens.has(token)) return false;
+  }
+  return true;
+}
+
+function reusedTopicSupported(
+  slug: string,
+  evidenceQuote: string,
+  topics: KnownTopic[] | undefined,
+): boolean {
+  const known = (topics ?? []).find((topic) => topicIdentity(topic.slug) === topicIdentity(slug));
+  if (!known) return true;
+  const distinctive = topicDistinctiveTokens(known);
+  if (distinctive.size === 0) return false;
+  const evidenceTokens = lexicalTokens(evidenceQuote);
+  return [...distinctive].every((token) => evidenceTokens.has(token));
+}
+
 function recordValue(value: unknown): Record<string, unknown> | undefined {
   return value && typeof value === 'object' && !Array.isArray(value)
     ? value as Record<string, unknown>
@@ -352,7 +463,7 @@ function sourceHighlight(quote: string): string | undefined {
 export function groundModelSummary(
   model: ModelSourceSummary,
   sourceText: string,
-  context: { kind: SourceKind; attribution?: string[] },
+  context: { kind: SourceKind; attribution?: string[]; topicCatalog?: KnownTopic[] },
 ): SourceSummary {
   const normalizedSource = normalizedKey(sourceText);
   const durableSignal = !isExplicitPlaceholderSource(normalizedSource);
@@ -370,6 +481,7 @@ export function groundModelSummary(
     durableSignal &&
     summaryEvidence.length > 0 &&
     summaryEvidence.every(supported) &&
+    claimReferencesSupported(model.summary!.text, summaryEvidence, context.topicCatalog) &&
     claimCoveredByEvidence(model.summary!.text, summaryEvidence, 0.45)
       ? model.summary!.text.trim()
       : '';
@@ -382,6 +494,7 @@ export function groundModelSummary(
         !isPlaceholder(item.text) &&
         supported(item.evidence_quote) &&
         isExplicitDecisionEvidence(item.evidence_quote, item.text) &&
+        claimReferencesSupported(item.text, [item.evidence_quote], context.topicCatalog) &&
         claimCoveredByEvidence(item.text, [item.evidence_quote], 0.5),
     )
     .map((item) => item.text.trim());
@@ -397,6 +510,7 @@ export function groundModelSummary(
             supported(item.evidence_quote) &&
             durableSignal &&
             isExplicitActionEvidence(item.evidence_quote, item.owner, item.task) &&
+            claimReferencesSupported(item.task, [item.evidence_quote], context.topicCatalog) &&
             claimCoveredByEvidence(item.task, [item.evidence_quote], 0.5),
         )
         .map((item) => ({ owner: item.owner.trim(), task: item.task.trim() }))
@@ -410,6 +524,7 @@ export function groundModelSummary(
         !isPlaceholder(item.text) &&
         supported(item.evidence_quote) &&
         isExplicitQuestionEvidence(item.evidence_quote) &&
+        claimReferencesSupported(item.text, [item.evidence_quote], context.topicCatalog) &&
         claimCoveredByEvidence(item.text, [item.evidence_quote], 0.5),
     )
     .map((item) => item.text.trim());
@@ -422,6 +537,14 @@ export function groundModelSummary(
         !isPlaceholder(fact.topic) &&
         !isPlaceholder(fact.fact) &&
         supported(fact.evidence_quote) &&
+        reusedTopicSupported(fact.topic, fact.evidence_quote, context.topicCatalog) &&
+        claimReferencesSupported(fact.fact, [fact.evidence_quote], context.topicCatalog) &&
+        claimReferencesSupported(
+          [fact.topic, fact.topic_title, fact.topic_description].filter(Boolean).join(' '),
+          [fact.evidence_quote],
+          context.topicCatalog,
+          false,
+        ) &&
         claimCoveredByEvidence(fact.fact, [fact.evidence_quote], 0.35),
     )
     .map((fact) => ({
@@ -522,7 +645,7 @@ function buildSystemPrompt(kind: SourceKind, topicCatalog?: KnownTopic[]): strin
 
   const knownTopics = renderTopicCatalog(topicCatalog);
   const topicGuidance = knownTopics
-    ? `\nApproved topic catalog:\n${knownTopics}\nReuse an exact catalog slug whenever a fact belongs there. Create a new topic only when none fits.\n`
+    ? `\nApproved topic catalog (classification labels only, never evidence):\n${knownTopics}\nReuse an exact catalog slug only when its distinctive slug terms occur in the fact's cited evidence. Never copy or substitute a person, project, product, number, or identifier from this catalog into a claim. Create a new topic when no evidence-supported catalog topic fits.\n`
     : '';
 
   return `You are the librarian of a memory-palace style knowledge base: a flat repository of small, densely linked markdown notes. Your job is to distill a ${sourceNoun} into durable knowledge.
@@ -662,9 +785,13 @@ export async function summarizeSource(input: {
 }): Promise<SourceSummary> {
   const header =
     input.kind === 'meeting'
-      ? `Meeting date: ${input.date}
-Duration: ~${input.durationMinutes ?? '?'} minutes
-Participants: ${(input.attribution ?? []).join(', ') || 'unknown'}`
+      ? [
+          `Meeting date: ${input.date}`,
+          ...(input.durationMinutes === undefined
+            ? []
+            : [`Duration: ~${input.durationMinutes} minutes`]),
+          `Participants: ${(input.attribution ?? []).join(', ') || 'unknown'}`,
+        ].join('\n')
       : `Kind: ${input.kind}
 Date: ${input.date}${input.title ? `\nTitle: ${input.title}` : ''}${input.origin ? `\nSource: ${input.origin}` : ''}${
           input.attribution?.length ? `\nAttribution: ${input.attribution.join(', ')}` : ''
@@ -709,6 +836,7 @@ ${chunks[index]}
       groundModelSummary(parsed, chunks[index], {
         kind: input.kind,
         attribution: input.attribution,
+        topicCatalog: input.topicCatalog,
       }),
     );
   }

@@ -535,10 +535,12 @@ export function readFrontmatter(content: string): Record<string, string> {
 
 function metaLine(meta: SourceMeta): string {
   if (meta.kind === 'meeting') {
-    return (
-      `**Date:** ${meta.date} - **Duration:** ~${meta.durationMinutes ?? '?'} min - ` +
-      `**Participants:** ${(meta.attribution ?? []).join(', ') || 'unknown'}`
-    );
+    const parts = [`**Date:** ${meta.date}`];
+    if (meta.durationMinutes !== undefined) {
+      parts.push(`**Duration:** ~${meta.durationMinutes} min`);
+    }
+    parts.push(`**Participants:** ${(meta.attribution ?? []).join(', ') || 'unknown'}`);
+    return parts.join(' - ');
   }
   const parts = [`**Date:** ${meta.date}`];
   if (meta.attribution?.length) parts.push(`**By:** ${meta.attribution.join(', ')}`);

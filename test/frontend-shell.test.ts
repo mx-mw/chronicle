@@ -70,3 +70,38 @@ test('source Library treats deletion and catalog availability as terminal UI sta
   assert.match(app, /state\.sourcesAvailable === false/);
   assert.match(app, /sequence === state\.renderSequence &&\s*state\.view === 'library' &&\s*state\.selectedSourceId === id/);
 });
+
+test('mobile navigation stays on one row and leaves content clearance', async () => {
+  const [html, css] = await Promise.all([
+    readAsset('index.html'),
+    readAsset('organic.css'),
+  ]);
+  const mobileNavigation = html.match(
+    /<nav class="mobile-tab-bar[\s\S]*?<\/nav>/,
+  )?.[0] ?? '';
+
+  assert.equal(mobileNavigation.match(/<button\b/g)?.length, 5);
+  assert.match(css, /\.workspace\s*\{[\s\S]*?padding:\s*1\.15rem 1rem 7\.3rem/);
+  assert.match(
+    css,
+    /\.mobile-tab-bar\s*\{[\s\S]*?grid-template-columns:\s*repeat\(5, minmax\(0, 1fr\)\);[\s\S]*?grid-auto-flow:\s*column/,
+  );
+});
+
+test('review and Home transforms retain topic metadata without exposing raw transcript links', async () => {
+  const [html, app] = await Promise.all([readAsset('index.html'), readAsset('app.js')]);
+
+  const reviewLinesScript = html.indexOf('/review-lines.js');
+  const appScript = html.indexOf('/app.js');
+  assert.ok(reviewLinesScript >= 0);
+  assert.ok(appScript >= 0);
+  assert.ok(reviewLinesScript < appScript);
+  assert.match(app, /reviewLines\.formatFactTopicLabel\(item\)/);
+  assert.match(app, /reviewLines\.parseFactTopicLabel\(rawTopicLabel\)/);
+  assert.match(app, /if \(topicReference\.topic\) return topicReference\.topic === existing\.topic/);
+  assert.match(app, /const existingFacts = safeArray\(state\.activeDraft\?\.facts\)/);
+  assert.match(app, /topic:\s*String\(existing\.topic \|\| topicLabel\)/);
+  assert.match(app, /existing\.topic_description \|\| existing\.topic_title \|\| topicLabel/);
+  assert.match(app, /\\\[\\\[transcripts\\\/\[\^\\\]\]\+\\\]\\\]/);
+  assert.doesNotMatch(app, /topic_title:\s*topic, topic_description:\s*topic/);
+});

@@ -162,6 +162,13 @@ export interface DiscordMessageSource {
   updatedAt: string;
 }
 
+export interface StoredDiscordReceipt {
+  channelId: string;
+  messageId: string;
+  /** The source revision whose processing state this receipt represents. */
+  sourceRevision: number;
+}
+
 export interface SourceSave {
   schemaVersion: 1;
   id: string;
@@ -170,6 +177,8 @@ export interface SourceSave {
   capturedAt: string;
   processingStatus: LiveProcessingStatus;
   reviewStatus: ReviewStatus;
+  /** Encrypted routing metadata for editing Chronicle's existing Discord reply. */
+  receipt?: StoredDiscordReceipt;
 }
 
 export interface SourceCatalogRecord {
@@ -221,6 +230,8 @@ export interface SourceCatalogUpdate {
   reviewStatus?: ReviewStatus;
   /** Pass null to remove a previous analysis. */
   analysis?: SourceAnalysis | null;
+  /** Pass null to stop updating a previous Discord receipt. */
+  receipt?: StoredDiscordReceipt | null;
 }
 
 export interface SourceCatalogUpdateOptions {
@@ -459,6 +470,48 @@ function isCatalogEntry(value: unknown): value is SourceCatalogEntry {
   );
 }
 
+function normalizedStoredReceipt(
+  value: unknown,
+  sourceRevision: number,
+  sourceChannelId: string,
+): StoredDiscordReceipt | undefined {
+  if (value === undefined) return undefined;
+  if (typeof value !== 'object' || value === null || Array.isArray(value)) {
+    throw new Error('save.receipt must be an object');
+  }
+  const candidate = value as Partial<StoredDiscordReceipt>;
+  const channelId = requireString(candidate.channelId as string, 'save.receipt.channelId');
+  const messageId = requireString(candidate.messageId as string, 'save.receipt.messageId');
+  if (!Number.isSafeInteger(candidate.sourceRevision) || candidate.sourceRevision! < 1) {
+    throw new Error('save.receipt.sourceRevision must be a positive integer');
+  }
+  if (candidate.sourceRevision !== sourceRevision) {
+    throw new Error('save.receipt.sourceRevision must match its source revision');
+  }
+  if (channelId !== sourceChannelId) {
+    throw new Error('save.receipt.channelId must match its source channel');
+  }
+  return { channelId, messageId, sourceRevision: candidate.sourceRevision };
+}
+
+function normalizedCatalogEntry(value: unknown): SourceCatalogEntry {
+  if (!isCatalogEntry(value)) throw new Error('unsupported record schema');
+  if (value.recordType === 'tombstone') return value;
+  if (!Object.prototype.hasOwnProperty.call(value.save, 'receipt')) return value;
+  const receipt = normalizedStoredReceipt(
+    value.save.receipt,
+    value.source.sourceRevision,
+    value.source.discord.channelId,
+  );
+  const normalized: SourceCatalogRecord = {
+    ...value,
+    save: { ...value.save },
+  };
+  if (receipt) normalized.save.receipt = receipt;
+  else delete normalized.save.receipt;
+  return normalized;
+}
+
 function encodeCursor(sourceId: string): string {
   return Buffer.from(sourceId, 'utf8').toString('base64url');
 }
@@ -602,7 +655,8 @@ export class EncryptedSourceCatalog {
       patch.sourceStatus === undefined &&
       patch.processingStatus === undefined &&
       patch.reviewStatus === undefined &&
-      !Object.prototype.hasOwnProperty.call(patch, 'analysis')
+      !Object.prototype.hasOwnProperty.call(patch, 'analysis') &&
+      !Object.prototype.hasOwnProperty.call(patch, 'receipt')
     ) {
       throw new Error('Source catalog update must change at least one field');
     }
@@ -639,6 +693,17 @@ export class EncryptedSourceCatalog {
       if (Object.prototype.hasOwnProperty.call(patch, 'analysis')) {
         if (patch.analysis === null || patch.analysis === undefined) delete next.analysis;
         else next.analysis = normalizedAnalysis(patch.analysis);
+      }
+      if (Object.prototype.hasOwnProperty.call(patch, 'receipt')) {
+        if (patch.receipt === null || patch.receipt === undefined) {
+          delete next.save.receipt;
+        } else {
+          next.save.receipt = normalizedStoredReceipt(
+            patch.receipt,
+            current.source.sourceRevision,
+            current.source.discord.channelId,
+          );
+        }
       }
       const durableRecord = durableJsonValue(next);
       await this.writeEntry(durableRecord);
@@ -759,9 +824,7 @@ export class EncryptedSourceCatalog {
         decipher.update(Buffer.from(envelope.ciphertext, 'base64')),
         decipher.final(),
       ]).toString('utf8');
-      const value: unknown = JSON.parse(plaintext);
-      if (!isCatalogEntry(value)) throw new Error('unsupported record schema');
-      return value;
+      return normalizedCatalogEntry(JSON.parse(plaintext));
     } catch {
       throw new Error('Unable to decrypt source catalog record');
     }

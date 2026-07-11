@@ -210,6 +210,7 @@ export async function completeText(request: {
       body: JSON.stringify({
         model: config.llmModel,
         max_tokens: maxTokens,
+        temperature: 0,
         messages: [
           { role: 'system', content: request.system },
           { role: 'user', content: request.user },

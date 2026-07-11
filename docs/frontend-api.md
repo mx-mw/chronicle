@@ -83,6 +83,20 @@ Each task contains `id`, `revision`, `status`, `owner`, `task`, timestamps, and 
 chronological `sources` array. Every source includes record/transcript paths and
 an Obsidian citation.
 
+`POST /api/tasks`
+
+Creates a direct task. Send a required `task` string and an optional `owner`:
+
+```http
+POST /api/tasks
+Content-Type: application/json
+
+{"task":"Verify the encrypted backup","owner":"Ethan"}
+```
+
+The response is `201 { task, created: true }` with an `ETag` containing revision
+`1`. Direct tasks use `origin: "web"` and have no meeting sources.
+
 `GET /api/tasks/:id`
 
 Returns `{ task, workspaceId }` and an `ETag` containing the current revision.

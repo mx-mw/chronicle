@@ -1,6 +1,9 @@
 (() => {
   'use strict';
 
+  const reviewLines = globalThis.ChronicleReviewLines;
+  if (!reviewLines) throw new Error('Review line parser did not load.');
+
   const state = {
     view: 'home',
     commandMode: 'ask',
@@ -125,6 +128,9 @@
     return String(value ?? '')
       .replace(/!\[([^\]]*)\]\([^)]*\)/g, '$1')
       .replace(/\[([^\]]+)\]\([^)]*\)/g, '$1')
+      .replace(/\s*\[\[transcripts\/[^\]]+\]\]/gi, '')
+      .replace(/\[\[[^\]|]+\|([^\]]+)\]\]/g, '$1')
+      .replace(/\[\[([^\]]+)\]\]/g, '$1')
       .replace(/(\*\*|__)(.*?)\1/g, '$2')
       .replace(/([*_~`])([^\n]*?)\1/g, '$2')
       .trim();
@@ -563,8 +569,9 @@
   }
 
   function editorMarkup(draft) {
-    const actionLines = draft.actions.map((item) => `${item.owner} | ${item.task}`);
-    const factLines = draft.facts.map((item) => `${item.topic} | ${item.fact}`);
+    const actionLines = draft.actions.map((item) => reviewLines.formatPairLine(item.owner, item.task));
+    const factLines = draft.facts.map((item) =>
+      reviewLines.formatPairLine(reviewLines.formatFactTopicLabel(item), item.fact));
     return `
       <section class="review-editor">
         <button class="button button-text back-button" type="button" data-back-to-queue>Back to review</button>
@@ -718,17 +725,7 @@
 
   function parsePairLines(value, fieldId, formatLabel) {
     clearReviewFieldError(fieldId);
-    const parsed = [];
-    const invalidLines = [];
-    String(value || '').split('\n').forEach((rawLine, index) => {
-      const line = rawLine.trim();
-      if (!line) return;
-      const separator = line.indexOf('|');
-      const left = separator >= 0 ? line.slice(0, separator).trim() : '';
-      const right = separator >= 0 ? line.slice(separator + 1).trim() : '';
-      if (!left || !right) invalidLines.push(index + 1);
-      else parsed.push([left, right]);
-    });
+    const { pairs, invalidLines } = reviewLines.parsePairText(value);
     if (invalidLines.length) {
       const message = `${formatLabel} required on line${invalidLines.length === 1 ? '' : 's'} ${invalidLines.join(', ')}.`;
       const field = document.getElementById(fieldId);
@@ -741,7 +738,7 @@
       field?.focus();
       throw new ReviewValidationError(message);
     }
-    return parsed;
+    return pairs;
   }
 
   function reviewPatch() {
@@ -751,8 +748,34 @@
     const data = new FormData(form);
     const actions = parsePairLines(data.get('actions'), 'draft-actions', 'Use Owner | Task')
       .map(([owner, task]) => ({ owner, task }));
+    const existingFacts = safeArray(state.activeDraft?.facts);
     const facts = parsePairLines(data.get('facts'), 'draft-facts', 'Use Topic | Fact')
-      .map(([topic, fact]) => ({ topic, topic_title: topic, topic_description: topic, fact }));
+      .map(([rawTopicLabel, fact]) => {
+        const topicReference = reviewLines.parseFactTopicLabel(rawTopicLabel);
+        const matching = existingFacts.find((item) => {
+          const existing = objectValue(item);
+          if (topicReference.topic) return topicReference.topic === existing.topic;
+          return topicReference.title === existing.topic || topicReference.title === existing.topic_title;
+        });
+        const existing = objectValue(matching);
+        const topicLabel = topicReference.title || topicReference.topic;
+        if (!existing.topic && !existing.topic_title) {
+          return {
+            topic: topicLabel,
+            topic_title: topicLabel,
+            topic_description: topicLabel,
+            fact,
+          };
+        }
+        return {
+          topic: String(existing.topic || topicLabel),
+          topic_title: String(existing.topic_title || topicLabel),
+          topic_description: String(
+            existing.topic_description || existing.topic_title || topicLabel,
+          ),
+          fact,
+        };
+      });
     return {
       summary: {
         title: String(data.get('title') || '').trim(),

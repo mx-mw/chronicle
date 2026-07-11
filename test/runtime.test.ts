@@ -3,6 +3,7 @@ import test from 'node:test';
 import {
   TimeoutError,
   assertModelEndpointAllowed,
+  isLoopbackHost,
   isLoopbackUrl,
   positiveIntegerEnv,
   withTimeout,
@@ -29,6 +30,9 @@ test('withTimeout resolves completed work and rejects stalled work', async () =>
 test('model endpoints are local unless explicitly acknowledged', () => {
   assert.equal(isLoopbackUrl('http://127.0.0.1:11434/v1'), true);
   assert.equal(isLoopbackUrl('http://localhost:8080/v1'), true);
+  assert.equal(isLoopbackUrl('http://[::ffff:127.8.4.2]:8080/v1'), true);
+  assert.equal(isLoopbackHost('0:0:0:0:0:ffff:7f00:1'), true);
+  assert.equal(isLoopbackHost('::ffff:10.0.0.1'), false);
   assert.equal(isLoopbackUrl('https://models.example.com/v1'), false);
   assert.equal(isLoopbackUrl('http://127.attacker.example/v1'), false);
   assert.equal(isLoopbackUrl('http://127.0.0.1.evil.example/v1'), false);

@@ -23,6 +23,15 @@ export interface AuthorizationDecision {
   reason?: AuthorizationDenial;
 }
 
+/** A usable policy names a guild, channel, and at least one identity rule. */
+export function completeDiscordPolicy(policy: AccessPolicy): boolean {
+  return Boolean(
+    policy.guildIds.length &&
+      policy.channelIds.length &&
+      (policy.userIds.length || policy.roleIds.length),
+  );
+}
+
 function includes(list: readonly string[], value: string | null): boolean {
   if (list.includes('*')) return value !== null;
   return value !== null && list.includes(value);

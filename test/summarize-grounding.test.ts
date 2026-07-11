@@ -460,6 +460,176 @@ test('drops a mismatched durable fact instead of promoting its evidence as knowl
   assert.deepEqual(grounded.facts, []);
 });
 
+test('topic catalog cannot replace source entities or identifiers', () => {
+  const evidence =
+    '[00:00] Ethan: We decided to use the Juniper 7 code name. I will verify the backup checklist by July 20th. Project Juniper uses port 4303.';
+  const grounded = groundModelSummary(
+    {
+      title: 'Juniper acceptance meeting',
+      slug: 'juniper-acceptance-meeting',
+      summary: {
+        text: 'Ethan selected Project Atlas and port 4242, then committed to the backup checklist.',
+        evidence_quotes: [evidence],
+      },
+      decisions: [
+        { text: 'Use the Atlas 4242 code name.', evidence_quote: evidence },
+        { text: 'Use the Juniper 7 code name.', evidence_quote: evidence },
+      ],
+      action_items: [
+        {
+          owner: 'Ethan',
+          task: 'Verify the Project Atlas backup checklist by July 20th.',
+          evidence_quote: evidence,
+        },
+        {
+          owner: 'Ethan',
+          task: 'Verify the backup checklist by July 20th.',
+          evidence_quote: evidence,
+        },
+      ],
+      facts: [
+        {
+          topic: 'atlas',
+          topic_title: 'Project Atlas',
+          fact: 'Ethan will verify the backup checklist by July 20th.',
+          evidence_quote: evidence,
+        },
+        {
+          topic: 'project-juniper',
+          topic_title: 'Project Juniper',
+          topic_description: 'Project Juniper local sync settings',
+          fact: 'Project Juniper uses port 4303.',
+          evidence_quote: evidence,
+        },
+      ],
+    },
+    evidence,
+    {
+      kind: 'meeting',
+      attribution: ['Ethan'],
+      topicCatalog: [{
+        slug: 'atlas',
+        title: 'Project Atlas',
+        description: 'Project Atlas uses port 4242 for local sync.',
+      }],
+    },
+  );
+
+  assert.equal(grounded.summary, '');
+  assert.deepEqual(grounded.decisions, ['Use the Juniper 7 code name.']);
+  assert.deepEqual(grounded.action_items, [
+    { owner: 'Ethan', task: 'Verify the backup checklist by July 20th.' },
+  ]);
+  assert.deepEqual(grounded.facts, [
+    {
+      topic: 'project-juniper',
+      topic_title: 'Project Juniper',
+      topic_description: 'Project Juniper local sync settings',
+      fact: 'Project Juniper uses port 4303.',
+    },
+  ]);
+});
+
+test('rejects a lowercase entity supplied only by a catalog description', () => {
+  const source = '[00:00] Ethan: We decided to use sqlite for the offline index.';
+  const grounded = groundModelSummary(
+    {
+      title: 'Offline index storage',
+      slug: 'offline-index-storage',
+      decisions: [{
+        text: 'Use postgres for the offline index.',
+        evidence_quote: source,
+      }],
+    },
+    source,
+    {
+      kind: 'meeting',
+      attribution: ['Ethan'],
+      topicCatalog: [{
+        slug: 'database',
+        title: 'Database',
+        description: 'postgres storage',
+      }],
+    },
+  );
+
+  assert.deepEqual(grounded.decisions, []);
+});
+
+test('rejects a title-only catalog entity behind a generic slug', () => {
+  const source = '[00:00] Ethan: We decided to use SQLite storage.';
+  const grounded = groundModelSummary(
+    {
+      title: 'Storage decision',
+      slug: 'storage-decision',
+      decisions: [{
+        text: 'Use Atlas storage.',
+        evidence_quote: source,
+      }],
+    },
+    source,
+    {
+      kind: 'meeting',
+      attribution: ['Ethan'],
+      topicCatalog: [{ slug: 'storage', title: 'Project Atlas Storage' }],
+    },
+  );
+
+  assert.deepEqual(grounded.decisions, []);
+});
+
+test('rejects a changed identifier without relying on topic catalog context', () => {
+  const source = '[00:04] Ethan: Project Juniper uses port 4303.';
+  const grounded = groundModelSummary(
+    {
+      title: 'Juniper port',
+      slug: 'juniper-port',
+      facts: [{
+        topic: 'project-juniper',
+        fact: 'Project Juniper uses port 4242.',
+        evidence_quote: source,
+      }],
+    },
+    source,
+    { kind: 'meeting', attribution: ['Ethan'] },
+  );
+
+  assert.deepEqual(grounded.facts, []);
+});
+
+test('summarizeSource applies topic evidence checks to model output', async () => {
+  const originalFetch = globalThis.fetch;
+  const source = '[00:04] Ethan: Project Juniper uses port 4303.';
+  globalThis.fetch = async () => Response.json({
+    choices: [{
+      message: {
+        content: JSON.stringify({
+          title: 'Juniper port',
+          slug: 'juniper-port',
+          facts: [{
+            topic: 'atlas',
+            fact: 'Project Juniper uses port 4303.',
+            evidence_quote: source,
+          }],
+        }),
+      },
+    }],
+  });
+
+  try {
+    const summary = await summarizeSource({
+      text: source,
+      kind: 'meeting',
+      date: '2026-07-11',
+      attribution: ['Ethan'],
+      topicCatalog: [{ slug: 'atlas', title: 'Project Atlas' }],
+    });
+    assert.deepEqual(summary.facts, []);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
 test('summarizeSource enforces the evidence schema and chunks realistic meetings', async () => {
   const originalFetch = globalThis.fetch;
   let calls = 0;

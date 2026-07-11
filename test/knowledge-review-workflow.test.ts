@@ -195,6 +195,30 @@ test('review workflow gates approved notes and is idempotent', async () => {
       /## Decisions|## Action items|## Open questions|## Source highlights/,
     );
     assert.match(thinNote, /## Provenance\n- \[\[transcripts\//);
+
+    const unknownDurationDraft = await stageSourceDraft(
+      {
+        title: 'Meeting without duration',
+        slug: 'meeting-without-duration',
+        summary: 'The capture did not report its duration.',
+        decisions: [],
+        action_items: [],
+        open_questions: [],
+        facts: [],
+      },
+      'A source without duration metadata.',
+      { ...meta, date: '2026-07-13', durationMinutes: undefined },
+      { workspaceId: 'team:max' },
+    );
+    const unknownDurationApproval = await approveDraft(unknownDurationDraft.id, {
+      workspaceId: 'team:max',
+    });
+    const unknownDurationNote = await readFile(unknownDurationApproval.meetingPath, 'utf8');
+    assert.match(
+      unknownDurationNote,
+      /\*\*Date:\*\* 2026-07-13 - \*\*Participants:\*\* Ethan, Max/,
+    );
+    assert.doesNotMatch(unknownDurationNote, /Duration|~\? min/);
   } finally {
     globalThis.fetch = originalFetch;
   }

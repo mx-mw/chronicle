@@ -32,6 +32,8 @@ test('loopback recognition covers local IPv4 and IPv6 without trusting arbitrary
   assert.equal(isLoopbackHost('127.0.0.1'), true);
   assert.equal(isLoopbackHost('127.8.4.2'), true);
   assert.equal(isLoopbackHost('::1'), true);
+  assert.equal(isLoopbackHost('::ffff:127.8.4.2'), true);
+  assert.equal(isLoopbackHost('0:0:0:0:0:ffff:7f00:1'), true);
   assert.equal(isLoopbackHost('0.0.0.0'), false);
   assert.equal(isLoopbackHost('chronicle.example'), false);
   assert.equal(isLoopbackHost('127.attacker.example'), false);
@@ -44,11 +46,21 @@ test('loopback binding rejects DNS rebinding Host headers', () => {
   assert.equal(isTrustedHostHeader('attacker.example:4321', '127.0.0.1'), false);
   assert.equal(isTrustedHostHeader('127.0.0.1.evil:4321', '127.0.0.1'), false);
   assert.equal(isTrustedHostHeader('localhost@attacker.example', '127.0.0.1'), false);
+  assert.equal(isTrustedHostHeader('chronicle.example', '0.0.0.0', 'chronicle.example'), true);
+  assert.equal(isTrustedHostHeader('attacker.example', '0.0.0.0', 'chronicle.example'), false);
+  assert.equal(isTrustedHostHeader('attacker.example', '0.0.0.0', ''), false);
 });
 
-test('remote binding requires a token', () => {
+test('remote binding requires a token and an exact host boundary', () => {
   assert.throws(() => validateWebBinding('0.0.0.0', ''), /WEB_AUTH_TOKEN/);
-  assert.doesNotThrow(() => validateWebBinding('0.0.0.0', 'long-random-token'));
+  assert.throws(
+    () => validateWebBinding('0.0.0.0', 'long-random-token', ''),
+    /WEB_ALLOWED_HOSTS/,
+  );
+  assert.doesNotThrow(() =>
+    validateWebBinding('0.0.0.0', 'long-random-token', 'chronicle.example'),
+  );
+  assert.doesNotThrow(() => validateWebBinding('10.0.0.5', 'long-random-token', ''));
   assert.doesNotThrow(() => validateWebBinding('127.0.0.1', ''));
 });
 
@@ -287,12 +299,48 @@ test('HTTP review and note endpoints enforce conflicts and workspace containment
     const deniedRaw = await fetch(`${base}/api/notes/transcripts/unattached.md`, { headers });
     assert.equal(deniedRaw.status, 403);
 
-    const trust = await fetch(`${base}/api/trust`, { headers });
-    assert.equal(trust.status, 200);
-    const trustBody = await trust.json() as { index: { exists: boolean; fresh: boolean; ready: boolean } };
-    assert.equal(trustBody.index.exists, false);
-    assert.equal(trustBody.index.fresh, false);
-    assert.equal(trustBody.index.ready, false);
+    const policyKeys = [
+      'RECORD_GUILD_IDS',
+      'RECORD_CHANNEL_IDS',
+      'RECORD_USER_IDS',
+      'RECALL_GUILD_IDS',
+      'RECALL_CHANNEL_IDS',
+      'RECALL_USER_IDS',
+      'DISCORD_TOKEN',
+    ] as const;
+    const previousPolicy = Object.fromEntries(
+      policyKeys.map((key) => [key, process.env[key]]),
+    );
+    process.env.RECORD_GUILD_IDS = 'guild-alpha';
+    process.env.RECORD_CHANNEL_IDS = 'channel-alpha';
+    process.env.RECORD_USER_IDS = 'user-alpha';
+    process.env.RECALL_GUILD_IDS = 'guild-alpha';
+    process.env.RECALL_CHANNEL_IDS = 'channel-alpha';
+    process.env.RECALL_USER_IDS = 'user-alpha';
+    delete process.env.DISCORD_TOKEN;
+    try {
+      const trust = await fetch(`${base}/api/trust`, { headers });
+      assert.equal(trust.status, 200);
+      const trustBody = await trust.json() as {
+        issues: string[];
+        index: { exists: boolean; fresh: boolean; ready: boolean };
+      };
+      assert.equal(trustBody.index.exists, false);
+      assert.equal(trustBody.index.fresh, false);
+      assert.equal(trustBody.index.ready, false);
+      assert.equal(
+        trustBody.issues.includes(
+          'Discord bot token is not configured, so Discord features cannot be online.',
+        ),
+        true,
+      );
+    } finally {
+      for (const key of policyKeys) {
+        const value = previousPolicy[key];
+        if (value === undefined) delete process.env[key];
+        else process.env[key] = value;
+      }
+    }
 
     const taskList = await fetch(`${base}/api/tasks`, { headers });
     assert.equal(taskList.status, 200);

@@ -1,3 +1,4 @@
+import { readdir } from 'node:fs/promises';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { config } from './config.js';
@@ -40,15 +41,36 @@ function factLines(document: ArchiveDocument): string[] {
     .map((line) => line.slice(2).trim());
 }
 
-function targetCandidates(target: string, sourceFile: string): string[] {
-  const clean = target.split('|')[0].trim().replace(/\.md$/i, '');
+function normalizeLinkPath(value: string): string {
+  const normalized = path.posix.normalize(value.replace(/\\/g, '/')).replace(/^\.\//, '');
+  return normalized === '.' ? '' : normalized;
+}
+
+function workspacePathPrefix(sourceFile: string): string {
+  const parts = sourceFile.split('/');
+  const workspaceIndex = parts.indexOf('workspaces');
+  return workspaceIndex >= 0 && parts[workspaceIndex + 1]
+    ? parts.slice(0, workspaceIndex + 2).join('/')
+    : '';
+}
+
+function cleanLinkTarget(target: string): string {
+  return normalizeLinkPath(
+    target.split('|')[0].split('#')[0].trim().replace(/\.md$/i, ''),
+  );
+}
+
+function targetCandidates(clean: string, sourceFile: string): string[] {
   const sourceDirectory = path.posix.dirname(sourceFile);
-  return [
-    `${clean}.md`,
-    `${sourceDirectory}/${clean}.md`,
-    clean,
-    path.posix.basename(clean),
-  ].map((value) => value.replace(/^\.\//, ''));
+  const workspacePrefix = workspacePathPrefix(sourceFile);
+  const bases = new Set([
+    normalizeLinkPath(clean),
+    normalizeLinkPath(path.posix.join(sourceDirectory, clean)),
+    normalizeLinkPath(path.posix.join(workspacePrefix, clean)),
+  ]);
+  return [...bases]
+    .filter(Boolean)
+    .flatMap((candidate) => [candidate, `${candidate}.md`]);
 }
 
 function latestFactDate(lines: string[]): string | undefined {
@@ -58,15 +80,39 @@ function latestFactDate(lines: string[]): string | undefined {
     .at(-1);
 }
 
+async function listWorkspaceTranscriptTargets(
+  kbDir: string,
+  documents: ArchiveDocument[],
+): Promise<string[]> {
+  if (documents.length === 0) return [];
+  const targets: string[] = [];
+  const workspacePrefixes = new Set(documents.map((document) => workspacePathPrefix(document.file)));
+  for (const workspacePrefix of workspacePrefixes) {
+    const transcriptDirectory = path.join(kbDir, workspacePrefix, 'transcripts');
+    const entries = await readdir(transcriptDirectory, { withFileTypes: true }).catch(
+      (error: NodeJS.ErrnoException) => {
+        if (error.code === 'ENOENT') return [];
+        throw error;
+      },
+    );
+    targets.push(...entries
+      .filter((entry) => entry.isFile() && entry.name.toLowerCase().endsWith('.md'))
+      .map((entry) => path.relative(kbDir, path.join(transcriptDirectory, entry.name)).split(path.sep).join('/')));
+  }
+  return targets;
+}
+
 export async function runMaintenance(options: {
+  kbDir?: string;
   workspaceId?: string;
   staleDays?: number;
   now?: Date;
 } = {}): Promise<MaintenanceReport> {
+  const kbDir = options.kbDir ?? config.kbDir;
   const workspaceId = options.workspaceId ?? process.env.WORKSPACE_ID ?? 'default';
   const staleDays = options.staleDays ?? 90;
   const now = options.now ?? new Date();
-  const documents = await listApprovedDocuments({ workspaceId });
+  const documents = await listApprovedDocuments({ kbDir, workspaceId });
   const topics = documents.filter(
     (document) => document.type === 'topic' || document.file.split('/').includes('topics'),
   );
@@ -74,18 +120,23 @@ export async function runMaintenance(options: {
 
   const allPaths = new Set<string>();
   const basenames = new Set<string>();
-  for (const document of documents) {
-    const noExtension = document.file.replace(/\.md$/i, '');
-    allPaths.add(document.file);
+  const linkTargets = [
+    ...documents.map((document) => document.file),
+    ...await listWorkspaceTranscriptTargets(kbDir, documents),
+  ];
+  for (const file of linkTargets) {
+    const noExtension = file.replace(/\.md$/i, '');
+    allPaths.add(file);
     allPaths.add(noExtension);
     basenames.add(path.posix.basename(noExtension));
   }
 
   for (const document of documents) {
     for (const match of document.body.matchAll(/\[\[([^\]]+)\]\]/g)) {
-      const candidates = targetCandidates(match[1], document.file);
-      const found = candidates.some(
-        (candidate) => allPaths.has(candidate) || basenames.has(path.posix.basename(candidate.replace(/\.md$/, ''))),
+      const cleanTarget = cleanLinkTarget(match[1]);
+      const candidates = targetCandidates(cleanTarget, document.file);
+      const found = candidates.some((candidate) => allPaths.has(candidate)) || (
+        !cleanTarget.includes('/') && basenames.has(cleanTarget)
       );
       if (!found) {
         issues.push({
